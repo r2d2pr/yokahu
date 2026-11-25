@@ -5,8 +5,9 @@ pub mod modals;
 use crate::markdown;
 use crate::mcp_client::{self, DiscoveredMcpTool, McpConfigFile, McpPool};
 use crate::ollama;
+use crate::skills;
 use crate::theme::{self, ThemeConfig};
-use crate::tools::{self, SafetyMode, WorkspaceEntry};
+use crate::tools::{self, BackgroundTasks, SafetyMode, WorkspaceEntry};
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, RichText, Stroke};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -142,6 +143,14 @@ pub struct PersistedState {
     pub whisper_cli: String,
     #[serde(default)]
     pub web_tools_enabled: bool,
+    #[serde(default)]
+    pub worker_model: String,
+    #[serde(default = "default_true")]
+    pub include_antigravity_skills: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for PersistedState {
@@ -167,6 +176,8 @@ impl Default for PersistedState {
             compare_model: "qwen2.5-coder:7b-instruct-q6_K".to_string(),
             whisper_cli: "whisper".to_string(),
             web_tools_enabled: false,
+            worker_model: "qwen3.5:9b".to_string(),
+            include_antigravity_skills: true,
         }
     }
 }
@@ -176,6 +187,18 @@ pub enum SidebarTab {
     Chats,
     Files,
     Settings,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskStep {
+    pub title: String,
+    pub status: String,
+}
+
+pub struct PendingQuestion {
+    pub question: String,
+    pub options: Vec<String>,
+    pub reply_tx: Sender<String>,
 }
 
 pub struct PendingApproval {
@@ -193,6 +216,9 @@ pub enum WorkerEvent {
     Token(String),
     CompareToken(String),
     Transcript(String),
+    Focus(String),
+    Steps(Vec<TaskStep>),
+    AskQuestion(PendingQuestion),
     ToolStart(String),
     ToolResult { name: String, output: String },
     NeedApproval(PendingApproval),
@@ -245,6 +271,11 @@ pub struct YokahuApp {
     pub new_persona_name: String,
     pub renaming_chat: Option<(String, String)>,
     pub recording_mic: bool,
+    pub bg_tasks: Arc<BackgroundTasks>,
+    pub task_steps: Vec<TaskStep>,
+    pub focus_text: String,
+    pub pending_question: Option<PendingQuestion>,
+    pub question_custom: String,
     pub logo_tex: Option<egui::TextureHandle>,
     pub status_note: String,
 }
@@ -330,6 +361,11 @@ impl YokahuApp {
             new_persona_name: String::new(),
             renaming_chat: None,
             recording_mic: false,
+            bg_tasks: Arc::new(BackgroundTasks::default()),
+            task_steps: Vec::new(),
+            focus_text: String::new(),
+            pending_question: None,
+            question_custom: String::new(),
             logo_tex,
             status_note: String::new(),
         };
@@ -398,6 +434,12 @@ impl YokahuApp {
         if raw.is_empty() && self.attachments.is_empty() {
             return;
         }
+        if raw == "/compact" {
+            self.prompt_input.clear();
+            self.compact_active_chat();
+            return;
+        }
+        let raw = skills::expand_slash_command(&raw).unwrap_or(raw);
         if self.state.chats.is_empty() {
             self.new_chat();
         }
@@ -465,6 +507,7 @@ impl YokahuApp {
         let base_url = self.state.base_url.clone();
         let api_key = self.state.api_key.clone();
         let model = self.state.model.clone();
+        let worker_model = self.state.worker_model.clone();
         let system = self.state.system_prompt.clone();
         let think = self.state.think;
         let temp = self.state.temperature;
@@ -473,9 +516,11 @@ impl YokahuApp {
         let workspace = self.state.workspace.clone().map(PathBuf::from);
         let safety = self.state.safety_mode;
         let web_tools = self.state.web_tools_enabled;
+        let inc_agy = self.state.include_antigravity_skills;
         let mcp_cfg = self.mcp_cfg.clone();
         let mcp_tools = self.mcp_tools.clone();
         let mcp_pool = self.mcp_pool.clone();
+        let bg_tasks = self.bg_tasks.clone();
         let tx = self.tx.clone();
         let cancel = self.cancel_flag.clone();
         let ctx_clone = ctx.clone();
@@ -493,8 +538,8 @@ impl YokahuApp {
 
         thread::spawn(move || {
             agent::run_agent_loop(
-                history, prov, base_url, api_key, model, system, think, temp, num_ctx, keep_alive,
-                workspace, safety, web_tools, mcp_cfg, mcp_tools, mcp_pool, tx, cancel, ctx_clone,
+                history, prov, base_url, api_key, model, worker_model, system, think, temp, num_ctx, keep_alive,
+                workspace, safety, web_tools, inc_agy, mcp_cfg, mcp_tools, mcp_pool, bg_tasks, tx, cancel, ctx_clone,
             );
         });
         if cmp_enabled {
@@ -523,6 +568,40 @@ impl YokahuApp {
         self.state.chats.insert(0, forked);
         self.state.active_id = Some(id);
         save_state(&self.state);
+    }
+
+    fn compact_active_chat(&mut self) {
+        if self.state.chats.is_empty() {
+            return;
+        }
+        let idx = self.active_chat_idx();
+        let msgs = &mut self.state.chats[idx].messages;
+        if msgs.len() <= 4 {
+            self.status_note = "Chat already compact".to_string();
+            return;
+        }
+        let keep_from = msgs.len() - 2;
+        let mut summary = String::from("[Compacted earlier conversation summary]\n");
+        for m in &msgs[..keep_from] {
+            if m.role == "user" || m.role == "assistant" {
+                summary.push_str(&format!("- {}: {}\n", m.role, truncate(&m.content.replace('\n', " "), 120)));
+            }
+        }
+        let tail = msgs.split_off(keep_from);
+        msgs.clear();
+        msgs.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: summary,
+            thinking: String::new(),
+            model: "system-compact".to_string(),
+            images: Vec::new(),
+            tool_name: String::new(),
+            compare_model: String::new(),
+            compare_content: String::new(),
+        });
+        msgs.extend(tail);
+        save_state(&self.state);
+        self.status_note = "Compacted older messages".to_string();
     }
 
     fn regenerate_at(&mut self, ctx: &egui::Context, msg_idx: usize) {
@@ -646,6 +725,12 @@ impl eframe::App for YokahuApp {
                     }
                     self.prompt_input.push_str(&text);
                 }
+                WorkerEvent::Focus(f) => self.focus_text = f,
+                WorkerEvent::Steps(s) => self.task_steps = s,
+                WorkerEvent::AskQuestion(q) => {
+                    self.question_custom.clear();
+                    self.pending_question = Some(q);
+                }
                 WorkerEvent::ToolStart(desc) => {
                     if !self.state.chats.is_empty() {
                         let idx = self.active_chat_idx();
@@ -688,6 +773,8 @@ impl eframe::App for YokahuApp {
                 WorkerEvent::Done => {
                     self.busy = false;
                     self.pending_approval = None;
+                    self.pending_question = None;
+                    self.focus_text.clear();
                     save_state(&self.state);
                 }
             }
@@ -1048,6 +1135,21 @@ impl eframe::App for YokahuApp {
                                 if ui.checkbox(&mut self.state.web_tools_enabled, "Web Search / Fetch URL (online)").changed() {
                                     save_state(&self.state);
                                 }
+                                if ui.checkbox(&mut self.state.include_antigravity_skills, "Load ~/.gemini/config/skills").changed() {
+                                    save_state(&self.state);
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Subagent:").size(11.5).color(th.c_muted()));
+                                    egui::ComboBox::from_id_salt("worker_model_pick")
+                                        .selected_text(truncate(&self.state.worker_model, 22))
+                                        .show_ui(ui, |ui| {
+                                            for m in &self.models {
+                                                if ui.selectable_value(&mut self.state.worker_model, m.clone(), m).changed() {
+                                                    save_state(&self.state);
+                                                }
+                                            }
+                                        });
+                                });
                                 if ui.checkbox(&mut self.state.compare_enabled, "Compare 2 models side-by-side").changed() {
                                     save_state(&self.state);
                                 }
@@ -1140,6 +1242,33 @@ impl eframe::App for YokahuApp {
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.set_max_width(760.0);
+
+                    // Slash command autocomplete when typing '/' at start
+                    if self.prompt_input.starts_with('/') && !self.prompt_input.contains(' ') && !self.prompt_input.contains('\n') {
+                        let q = self.prompt_input.to_lowercase();
+                        let matches: Vec<(&str, &str)> = skills::SLASH_COMMANDS
+                            .iter()
+                            .copied()
+                            .filter(|(cmd, _)| cmd.starts_with(&q))
+                            .collect();
+                        if !matches.is_empty() {
+                            let sl_frame = egui::Frame::NONE
+                                .fill(th.c_elevated())
+                                .stroke(Stroke::new(1.0, th.c_border()))
+                                .corner_radius(CornerRadius::same(10))
+                                .inner_margin(8.0);
+                            sl_frame.show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    for (cmd, desc) in matches {
+                                        if ui.small_button(cmd).on_hover_text(desc).clicked() {
+                                            self.prompt_input = format!("{} ", cmd);
+                                        }
+                                    }
+                                });
+                            });
+                            ui.add_space(4.0);
+                        }
+                    }
 
                     // @filename autocomplete popup when workspace is active
                     if !self.workspace_tree.is_empty() {
@@ -1321,6 +1450,53 @@ impl eframe::App for YokahuApp {
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
                             ui.set_max_width(760.0);
+
+                            if !self.focus_text.is_empty() {
+                                let f_frame = egui::Frame::NONE
+                                    .fill(th.c_elevated())
+                                    .stroke(Stroke::new(1.0, th.c_accent()))
+                                    .corner_radius(CornerRadius::same(12))
+                                    .inner_margin(egui::Margin::symmetric(12, 6));
+                                f_frame.show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        icons::status_dot(ui, th.c_accent());
+                                        ui.label(RichText::new(&self.focus_text).size(12.0).color(th.c_text()));
+                                    });
+                                });
+                                ui.add_space(6.0);
+                            }
+
+                            if !self.task_steps.is_empty() {
+                                let s_frame = egui::Frame::NONE
+                                    .fill(th.c_surface())
+                                    .stroke(Stroke::new(1.0, th.c_border()))
+                                    .corner_radius(CornerRadius::same(12))
+                                    .inner_margin(10.0);
+                                s_frame.show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Task Checklist").size(12.0).strong().color(th.c_text()));
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if !self.busy && ui.small_button("Clear").clicked() {
+                                                self.task_steps.clear();
+                                            }
+                                        });
+                                    });
+                                    for step in &self.task_steps {
+                                        let (tag, col) = match step.status.as_str() {
+                                            "done" => ("[x]", GREEN),
+                                            "in_progress" => ("[~]", th.c_accent()),
+                                            "failed" => ("[!]", RED),
+                                            _ => ("[ ]", th.c_muted()),
+                                        };
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(tag).font(FontId::new(12.0, FontFamily::Monospace)).color(col));
+                                            ui.label(RichText::new(&step.title).size(12.5).color(th.c_text()));
+                                        });
+                                    }
+                                });
+                                ui.add_space(8.0);
+                            }
+
                             let chat = &self.state.chats[self.active_chat_idx()];
                             if chat.messages.is_empty() {
                                 ui.add_space(40.0);
@@ -1516,6 +1692,37 @@ impl eframe::App for YokahuApp {
                                 });
                                 if !decided {
                                     self.pending_approval = Some(pending);
+                                }
+                            }
+
+                            if let Some(pq) = self.pending_question.take() {
+                                let qcard = egui::Frame::NONE
+                                    .fill(th.c_surface())
+                                    .stroke(Stroke::new(1.5, th.c_accent()))
+                                    .corner_radius(CornerRadius::same(12))
+                                    .inner_margin(12.0);
+                                let mut answered = false;
+                                qcard.show(ui, |ui| {
+                                    ui.label(RichText::new(&pq.question).strong().color(th.c_text()));
+                                    ui.add_space(6.0);
+                                    for opt in &pq.options {
+                                        if ui.button(opt).clicked() {
+                                            let _ = pq.reply_tx.send(opt.clone());
+                                            answered = true;
+                                        }
+                                    }
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.add(egui::TextEdit::singleline(&mut self.question_custom).hint_text("Or type custom answer...").desired_width(320.0));
+                                        if ui.button("Reply").clicked() && !self.question_custom.trim().is_empty() {
+                                            let _ = pq.reply_tx.send(self.question_custom.trim().to_string());
+                                            self.question_custom.clear();
+                                            answered = true;
+                                        }
+                                    });
+                                });
+                                if !answered {
+                                    self.pending_question = Some(pq);
                                 }
                             }
                         });

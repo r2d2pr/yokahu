@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SafetyMode {
@@ -91,14 +95,147 @@ pub fn ollama_tools_schema() -> Value {
         {
             "type": "function",
             "function": {
-                "name": "run_command",
-                "description": "Run a PowerShell command in the workspace directory.",
+                "name": "edit_file",
+                "description": "Surgically replace an exact target string in an existing workspace file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "command": { "type": "string", "description": "PowerShell command to execute." }
+                        "path": { "type": "string", "description": "Target file path." },
+                        "target": { "type": "string", "description": "Exact existing text to replace." },
+                        "replacement": { "type": "string", "description": "Replacement text." }
+                    },
+                    "required": ["path", "target", "replacement"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "find_files",
+                "description": "Find files in the workspace matching a filename substring or extension.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Case-insensitive filename or extension substring (e.g. '.rs' or 'cargo')." },
+                        "path": { "type": "string", "description": "Optional subdirectory." }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_command",
+                "description": "Run a shell command in the workspace directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "Command to execute." }
                     },
                     "required": ["command"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "spawn_background",
+                "description": "Start a long-running command in the background and return its task ID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "Command to run in background." }
+                    },
+                    "required": ["command"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "manage_tasks",
+                "description": "List, inspect logs/status, or kill background tasks.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list", "status", "kill"] },
+                        "id": { "type": "integer", "description": "Task ID for status/kill." }
+                    },
+                    "required": ["action"]
+                }
+            }
+        }
+    ])
+}
+
+pub fn agent_ui_tools_schema() -> Value {
+    json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "update_steps",
+                "description": "Update the live task checklist shown to the user.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "steps": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": { "type": "string" },
+                                    "status": { "type": "string", "enum": ["pending", "in_progress", "done", "failed"] }
+                                },
+                                "required": ["title", "status"]
+                            }
+                        }
+                    },
+                    "required": ["steps"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "update_focus",
+                "description": "Set a short 3-8 word status banner describing what you are currently doing.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "focus": { "type": "string" }
+                    },
+                    "required": ["focus"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ask_question",
+                "description": "Ask the user a multiple-choice question in the chat UI and wait for their answer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": { "type": "string" },
+                        "options": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["question", "options"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "invoke_subagent",
+                "description": "Delegate an isolated read/research/drafting subtask to a worker subagent and return its summary.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "role": { "type": "string", "description": "Short role title e.g. 'Codebase Researcher'." },
+                        "prompt": { "type": "string", "description": "Clear task and what to return." }
+                    },
+                    "required": ["role", "prompt"]
                 }
             }
         }
@@ -106,7 +243,7 @@ pub fn ollama_tools_schema() -> Value {
 }
 
 pub fn is_mutating_tool(name: &str) -> bool {
-    matches!(name, "write_file" | "run_command")
+    matches!(name, "write_file" | "edit_file" | "run_command" | "spawn_background")
 }
 
 pub fn is_web_tool(name: &str) -> bool {
@@ -252,12 +389,29 @@ pub fn preview_tool(name: &str, args: &Value) -> String {
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
             format!("Write file: {} ({} lines)", path, content.lines().count())
         }
-        "run_command" => {
+        "edit_file" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Edit file: {}", path)
+        }
+        "run_command" | "spawn_background" => {
             let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            format!("Run PowerShell:\n{}", cmd)
+            format!("{}: {}", name, cmd)
         }
         _ => format!("{}({})", name, args),
     }
+}
+
+pub fn compute_edit_diff(workspace: Option<&Path>, args: &Value) -> Vec<(char, String)> {
+    let raw = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
+    let replacement = args.get("replacement").and_then(|v| v.as_str()).unwrap_or("");
+    let path = resolve_path(workspace, raw);
+    let old_content = fs::read_to_string(&path).unwrap_or_default();
+    if target.is_empty() || !old_content.contains(target) {
+        return vec![('-', format!("Target not found in {}", raw))];
+    }
+    let new_content = old_content.replace(target, replacement);
+    compute_diff_lines(&old_content, &new_content)
 }
 
 pub fn compute_write_diff(workspace: Option<&Path>, args: &Value) -> Vec<(char, String)> {
@@ -265,7 +419,10 @@ pub fn compute_write_diff(workspace: Option<&Path>, args: &Value) -> Vec<(char, 
     let new_content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
     let path = resolve_path(workspace, raw);
     let old_content = fs::read_to_string(&path).unwrap_or_default();
+    compute_diff_lines(&old_content, new_content)
+}
 
+fn compute_diff_lines(old_content: &str, new_content: &str) -> Vec<(char, String)> {
     let old_lines: Vec<&str> = old_content.lines().collect();
     let new_lines: Vec<&str> = new_content.lines().collect();
     let mut diff = Vec::new();
@@ -277,7 +434,6 @@ pub fn compute_write_diff(workspace: Option<&Path>, args: &Value) -> Vec<(char, 
         return diff;
     }
 
-    // Simple LCS/prefix-suffix diff for crisp approval preview
     let mut pref = 0;
     while pref < old_lines.len() && pref < new_lines.len() && old_lines[pref] == new_lines[pref] {
         pref += 1;
@@ -395,6 +551,22 @@ mod tests {
     fn strip_html_removes_tags() {
         assert_eq!(strip_html_tags("<h1>Hello</h1> <p>World</p>"), "Hello World");
     }
+
+    #[test]
+    fn edit_file_and_find_files_work() {
+        let ws = std::env::temp_dir().join("yokahu_test_edit");
+        let _ = fs::create_dir_all(&ws);
+        fs::write(ws.join("sample.rs"), "fn old_name() {}\n").unwrap();
+        let res = execute_tool(
+            Some(&ws),
+            "edit_file",
+            &json!({"path": "sample.rs", "target": "old_name", "replacement": "new_name"}),
+        );
+        assert!(res.contains("Replaced 1"));
+        let found = execute_tool(Some(&ws), "find_files", &json!({"pattern": ".rs"}));
+        assert!(found.contains("sample.rs"));
+        let _ = fs::remove_dir_all(&ws);
+    }
 }
 
 pub fn execute_tool(workspace: Option<&Path>, name: &str, args: &Value) -> String {
@@ -467,6 +639,39 @@ pub fn execute_tool(workspace: Option<&Path>, name: &str, args: &Value) -> Strin
                 Err(e) => format!("Error writing {}: {}", path.display(), e),
             }
         }
+        "edit_file" => {
+            let raw = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            let replacement = args.get("replacement").and_then(|v| v.as_str()).unwrap_or("");
+            let path = resolve_path(workspace, raw);
+            if !is_within_workspace(workspace, &path) {
+                return format!("Blocked: {} is outside workspace.", path.display());
+            }
+            let Ok(old) = fs::read_to_string(&path) else {
+                return format!("Error: cannot read {}", path.display());
+            };
+            if target.is_empty() || !old.contains(target) {
+                return format!("Error: target text not found in {}", path.display());
+            }
+            let count = old.matches(target).count();
+            let updated = old.replace(target, replacement);
+            match fs::write(&path, &updated) {
+                Ok(_) => format!("Replaced {} occurrence(s) in {}", count, path.display()),
+                Err(e) => format!("Error writing {}: {}", path.display(), e),
+            }
+        }
+        "find_files" => {
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let raw = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let root = resolve_path(workspace, raw);
+            let mut found = Vec::new();
+            find_walk(&root, &pattern, &mut found);
+            if found.is_empty() {
+                "No files matched.".to_string()
+            } else {
+                found.join("\n")
+            }
+        }
         "run_command" => {
             let cmd_str = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let mut cmd = Command::new("powershell");
@@ -485,6 +690,147 @@ pub fn execute_tool(workspace: Option<&Path>, name: &str, args: &Value) -> Strin
             }
         }
         other => format!("Unknown tool: {}", other),
+    }
+}
+
+fn find_walk(dir: &Path, pattern: &str, out: &mut Vec<String>) {
+    if out.len() >= 100 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        if out.len() >= 100 {
+            break;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if matches!(name.as_str(), ".git" | "target" | "node_modules") {
+            continue;
+        }
+        if path.is_dir() {
+            find_walk(&path, pattern, out);
+        } else if pattern.is_empty() || name.to_lowercase().contains(pattern) {
+            out.push(path.display().to_string());
+        }
+    }
+}
+
+pub struct BgTask {
+    pub command: String,
+    pub child: Child,
+    pub logs: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Default)]
+pub struct BackgroundTasks {
+    next_id: Mutex<u64>,
+    tasks: Mutex<HashMap<u64, BgTask>>,
+}
+
+impl BackgroundTasks {
+    pub fn spawn(&self, workspace: Option<&Path>, command: &str) -> String {
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("powershell");
+            c.args(["-NoProfile", "-Command", command]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", command]);
+            c
+        };
+        if let Some(ws) = workspace {
+            cmd.current_dir(ws);
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let Ok(mut child) = cmd.spawn() else {
+            return format!("Failed to spawn: {}", command);
+        };
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        if let Some(stdout) = child.stdout.take() {
+            let l = logs.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().flatten() {
+                    if let Ok(mut g) = l.lock() {
+                        g.push(line);
+                        if g.len() > 200 {
+                            let drop_n = g.len() - 200;
+                            g.drain(..drop_n);
+                        }
+                    }
+                }
+            });
+        }
+        if let Some(stderr) = child.stderr.take() {
+            let l = logs.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().flatten() {
+                    if let Ok(mut g) = l.lock() {
+                        g.push(format!("[err] {}", line));
+                        if g.len() > 200 {
+                            let drop_n = g.len() - 200;
+                            g.drain(..drop_n);
+                        }
+                    }
+                }
+            });
+        }
+
+        let mut id_g = self.next_id.lock().unwrap();
+        *id_g += 1;
+        let id = *id_g;
+        self.tasks.lock().unwrap().insert(
+            id,
+            BgTask {
+                command: command.to_string(),
+                child,
+                logs,
+            },
+        );
+        format!("Started background task #{} ({})", id, command)
+    }
+
+    pub fn manage(&self, action: &str, id: Option<u64>) -> String {
+        let mut map = self.tasks.lock().unwrap();
+        match action {
+            "list" => {
+                if map.is_empty() {
+                    return "No background tasks.".to_string();
+                }
+                let mut lines = Vec::new();
+                for (tid, t) in map.iter_mut() {
+                    let st = match t.child.try_wait() {
+                        Ok(Some(code)) => format!("exited ({})", code),
+                        _ => "running".to_string(),
+                    };
+                    lines.push(format!("#{} [{}] {}", tid, st, t.command));
+                }
+                lines.join("\n")
+            }
+            "status" => {
+                let Some(tid) = id else { return "Missing task id".to_string() };
+                let Some(t) = map.get_mut(&tid) else {
+                    return format!("Task #{} not found", tid);
+                };
+                let st = match t.child.try_wait() {
+                    Ok(Some(code)) => format!("exited ({})", code),
+                    _ => "running".to_string(),
+                };
+                let log_tail = t.logs.lock().unwrap().iter().rev().take(30).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                format!("Task #{} [{}]\n{}", tid, st, log_tail)
+            }
+            "kill" => {
+                let Some(tid) = id else { return "Missing task id".to_string() };
+                if let Some(mut t) = map.remove(&tid) {
+                    let _ = t.child.kill();
+                    let _ = t.child.wait();
+                    format!("Killed task #{}", tid)
+                } else {
+                    format!("Task #{} not found", tid)
+                }
+            }
+            other => format!("Unknown action: {}", other),
+        }
     }
 }
 
