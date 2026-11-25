@@ -3,6 +3,7 @@
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, RichText, Stroke};
 use yokahu::mcp_client::{self, DiscoveredMcpTool, McpConfigFile, McpServerConfig};
 use yokahu::ollama;
+use yokahu::theme::{self, ThemeConfig};
 use yokahu::tools::{self, SafetyMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -17,21 +18,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const BG_ROOT: Color32 = Color32::from_rgb(11, 14, 20);
-const BG_SIDEBAR: Color32 = Color32::from_rgb(16, 20, 29);
-const BG_SURFACE: Color32 = Color32::from_rgb(21, 26, 38);
-const BG_ELEVATED: Color32 = Color32::from_rgb(28, 35, 51);
-const BORDER: Color32 = Color32::from_rgb(37, 46, 66);
-const TEXT: Color32 = Color32::from_rgb(230, 237, 243);
-const TEXT_MUTED: Color32 = Color32::from_rgb(139, 150, 168);
-const TEXT_DIM: Color32 = Color32::from_rgb(92, 102, 122);
-const ACCENT: Color32 = Color32::from_rgb(88, 166, 255);
 const GREEN: Color32 = Color32::from_rgb(63, 185, 80);
 const RED: Color32 = Color32::from_rgb(248, 81, 73);
 const AMBER: Color32 = Color32::from_rgb(210, 153, 34);
 
 const ICON_PNG: &[u8] = include_bytes!("../../assets/icon.png");
-const LOGO_JPG: &[u8] = include_bytes!("../../assets/logo.jpg");
+const EMBLEM_PNG: &[u8] = include_bytes!("../../assets/emblem.png");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum ProviderKind {
@@ -98,6 +90,7 @@ struct PersistedState {
     keep_alive: String,
     safety_mode: SafetyMode,
     system_prompt: String,
+    theme: ThemeConfig,
 }
 
 impl Default for PersistedState {
@@ -116,6 +109,7 @@ impl Default for PersistedState {
             keep_alive: "5m".to_string(),
             safety_mode: SafetyMode::Safe,
             system_prompt: "You are a local AI assistant running in Yokahu. Be concise, accurate, and practical.".to_string(),
+            theme: ThemeConfig::default(),
         }
     }
 }
@@ -170,14 +164,16 @@ struct YokahuApp {
     scaffold_lang: String,
     mcp_status_msg: String,
     show_onboarding: bool,
+    show_theme_modal: bool,
+    show_sidebar: bool,
     logo_tex: Option<egui::TextureHandle>,
     status_note: String,
 }
 
 impl YokahuApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        apply_theme(&cc.egui_ctx);
         let state = load_state();
+        theme::apply_theme(&cc.egui_ctx, &state.theme);
         let mcp_cfg = mcp_client::load_config();
         let (tx, rx) = mpsc::channel();
 
@@ -197,11 +193,11 @@ impl YokahuApp {
             ctx_boot.request_repaint();
         });
 
-        let logo_tex = image::load_from_memory(LOGO_JPG).ok().map(|img| {
+        let logo_tex = image::load_from_memory(EMBLEM_PNG).ok().map(|img| {
             let rgba = img.to_rgba8();
             let size = [rgba.width() as usize, rgba.height() as usize];
             let color_img = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-            cc.egui_ctx.load_texture("yokahu_logo", color_img, egui::TextureOptions::LINEAR)
+            cc.egui_ctx.load_texture("yokahu_emblem", color_img, egui::TextureOptions::LINEAR)
         });
 
         let mut app = Self {
@@ -235,6 +231,8 @@ impl YokahuApp {
             scaffold_lang: "python".to_string(),
             mcp_status_msg: String::new(),
             show_onboarding: false,
+            show_theme_modal: false,
+            show_sidebar: true,
             logo_tex,
             status_note: String::new(),
         };
@@ -404,6 +402,7 @@ impl YokahuApp {
 impl eframe::App for YokahuApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let th = self.state.theme.clone();
 
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
@@ -498,24 +497,28 @@ impl eframe::App for YokahuApp {
         }
 
         // Sidebar
-        egui::Panel::left("sidebar")
-            .exact_size(285.0)
-            .frame(egui::Frame::NONE.fill(BG_SIDEBAR).inner_margin(12.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("YOKAHU").strong().size(16.0).color(TEXT));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let badge = egui::Frame::NONE
-                            .fill(Color32::from_rgba_unmultiplied(63, 185, 80, 30))
-                            .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(63, 185, 80, 90)))
-                            .corner_radius(CornerRadius::same(10))
-                            .inner_margin(egui::Margin::symmetric(8, 2));
-                        badge.show(ui, |ui| {
-                            ui.label(RichText::new("LOCAL").size(10.5).color(GREEN));
+        if self.show_sidebar {
+            egui::Panel::left("sidebar")
+                .exact_size(285.0)
+                .frame(egui::Frame::NONE.fill(th.c_sidebar()).inner_margin(14.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if let Some(tex) = &self.logo_tex {
+                            ui.image((tex.id(), egui::vec2(22.0, 22.0)));
+                        }
+                        ui.label(RichText::new("Yokahu").strong().size(16.0).color(th.c_text()));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let badge = egui::Frame::NONE
+                                .fill(Color32::from_rgba_unmultiplied(63, 185, 80, 28))
+                                .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(63, 185, 80, 85)))
+                                .corner_radius(CornerRadius::same(12))
+                                .inner_margin(egui::Margin::symmetric(8, 2));
+                            badge.show(ui, |ui| {
+                                ui.label(RichText::new("LOCAL").size(10.0).color(GREEN));
+                            });
                         });
                     });
-                });
-                ui.add_space(8.0);
+                    ui.add_space(10.0);
 
                 if ui
                     .add_sized([ui.available_width(), 30.0], egui::Button::new("+ New Conversation"))
@@ -574,7 +577,7 @@ impl eframe::App for YokahuApp {
                 ui.add_space(4.0);
 
                 // Workspace
-                ui.label(RichText::new("Workspace").size(11.5).color(TEXT_MUTED));
+                ui.label(RichText::new("Workspace").size(11.5).color(th.c_muted()));
                 ui.horizontal(|ui| {
                     if ui.button("Select Folder...").clicked() {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
@@ -588,12 +591,12 @@ impl eframe::App for YokahuApp {
                     }
                 });
                 let ws_label = self.state.workspace.as_deref().unwrap_or("None (Chat only)");
-                ui.label(RichText::new(truncate(ws_label, 36)).size(11.0).color(TEXT_DIM));
+                ui.label(RichText::new(truncate(ws_label, 36)).size(11.0).color(th.c_muted()));
                 ui.add_space(4.0);
 
                 // Safety Mode
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Safety:").size(12.0).color(TEXT_MUTED));
+                    ui.label(RichText::new("Safety:").size(12.0).color(th.c_muted()));
                     egui::ComboBox::from_id_salt("safety_combo")
                         .selected_text(self.state.safety_mode.label())
                         .show_ui(ui, |ui| {
@@ -607,7 +610,7 @@ impl eframe::App for YokahuApp {
 
                 // Model + Provider button
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Model:").size(12.0).color(TEXT_MUTED));
+                    ui.label(RichText::new("Model:").size(12.0).color(th.c_muted()));
                     if ui.small_button("Provider / Pull...").clicked() {
                         self.show_provider_modal = true;
                     }
@@ -637,7 +640,7 @@ impl eframe::App for YokahuApp {
                         save_state(&self.state);
                     }
                     ui.add_space(8.0);
-                    ui.label(RichText::new(format!("Temp: {:.1}", self.state.temperature)).size(11.5).color(TEXT_MUTED));
+                    ui.label(RichText::new(format!("Temp: {:.1}", self.state.temperature)).size(11.5).color(th.c_muted()));
                 });
                 if ui
                     .add(egui::Slider::new(&mut self.state.temperature, 0.0..=1.0).show_value(false))
@@ -648,7 +651,7 @@ impl eframe::App for YokahuApp {
 
                 // num_ctx + keep_alive
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Ctx: {}", self.state.num_ctx)).size(11.5).color(TEXT_MUTED));
+                    ui.label(RichText::new(format!("Ctx: {}", self.state.num_ctx)).size(11.5).color(th.c_muted()));
                     if ui
                         .add(egui::Slider::new(&mut self.state.num_ctx, 2048..=32768).step_by(1024.0).show_value(false))
                         .changed()
@@ -659,31 +662,42 @@ impl eframe::App for YokahuApp {
 
                 ui.horizontal(|ui| {
                     if ui
-                        .button(format!("MCP Servers ({})", self.mcp_tools.len()))
+                        .button(format!("MCP ({})", self.mcp_tools.len()))
                         .clicked()
                     {
                         self.show_mcp_modal = true;
                     }
-                    if ui.button("System...").clicked() {
+                    if ui.button("System").clicked() {
                         self.sys_draft = self.state.system_prompt.clone();
                         self.show_sys_modal = true;
                     }
+                    if ui.button("Colors").clicked() {
+                        self.show_theme_modal = true;
+                    }
                 });
             });
+        }
 
         // Topbar
         egui::Panel::top("topbar")
-            .exact_size(42.0)
-            .frame(egui::Frame::NONE.fill(BG_ROOT).inner_margin(egui::Margin::symmetric(16, 8)))
+            .exact_size(46.0)
+            .frame(egui::Frame::NONE.fill(th.c_root()).inner_margin(egui::Margin::symmetric(16, 10)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new(if self.show_sidebar { "Hide" } else { "Sidebar" }).corner_radius(CornerRadius::same(16)))
+                        .clicked()
+                    {
+                        self.show_sidebar = !self.show_sidebar;
+                    }
+                    ui.add_space(6.0);
                     let title = self
                         .state
                         .chats
                         .get(self.active_chat_idx())
                         .map(|c| c.title.as_str())
                         .unwrap_or("New Conversation");
-                    ui.label(RichText::new(title).size(14.0).color(TEXT_MUTED));
+                    ui.label(RichText::new(title).size(14.0).color(th.c_muted()));
                     if !self.status_note.is_empty() {
                         ui.label(RichText::new(format!("  |  {}", self.status_note)).size(11.5).color(GREEN));
                     }
@@ -693,8 +707,8 @@ impl eframe::App for YokahuApp {
                         } else {
                             (AMBER, format!("{} Offline", self.state.provider.label()))
                         };
-                        ui.label(RichText::new(status_txt).size(12.0).color(TEXT_MUTED));
-                        ui.label(RichText::new("●").size(12.0).color(dot_col));
+                        ui.label(RichText::new(status_txt).size(12.0).color(th.c_muted()));
+                        ui.label(RichText::new("\u{25CF}").size(12.0).color(dot_col));
                         if ui.small_button("Export .md").clicked() {
                             self.export_active_chat(false);
                         }
@@ -707,19 +721,21 @@ impl eframe::App for YokahuApp {
 
         // Composer
         egui::Panel::bottom("composer")
-            .frame(egui::Frame::NONE.fill(BG_ROOT).inner_margin(egui::Margin::symmetric(20, 12)))
+            .frame(egui::Frame::NONE.fill(th.c_root()).inner_margin(egui::Margin::symmetric(20, 14)))
             .show(ui, |ui| {
-                let frame = egui::Frame::NONE
-                    .fill(BG_SURFACE)
-                    .stroke(Stroke::new(1.0, BORDER))
-                    .corner_radius(CornerRadius::same(12))
-                    .inner_margin(10.0);
-                frame.show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.set_max_width(760.0);
+                    let frame = egui::Frame::NONE
+                        .fill(th.c_surface())
+                        .stroke(Stroke::new(1.0, th.c_border()))
+                        .corner_radius(CornerRadius::same(16))
+                        .inner_margin(12.0);
+                    frame.show(ui, |ui| {
                     if !self.attachments.is_empty() {
                         ui.horizontal_wrapped(|ui| {
                             let mut rem: Option<usize> = None;
                             for (i, att) in self.attachments.iter().enumerate() {
-                                ui.label(RichText::new(&att.name).size(11.5).color(ACCENT));
+                                ui.label(RichText::new(&att.name).size(11.5).color(th.c_accent()));
                                 if ui.small_button("x").clicked() {
                                     rem = Some(i);
                                 }
@@ -760,7 +776,7 @@ impl eframe::App for YokahuApp {
                                 }
                             }
                         }
-                        ui.label(RichText::new("Drag & drop supported").size(11.0).color(TEXT_DIM));
+                        ui.label(RichText::new("Drag & drop supported").size(11.0).color(th.c_muted()));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if self.busy {
                                 if ui
@@ -770,7 +786,7 @@ impl eframe::App for YokahuApp {
                                     self.cancel_flag.store(true, Ordering::Relaxed);
                                 }
                             } else if ui
-                                .add(egui::Button::new(RichText::new("Send").color(BG_ROOT).strong()).fill(ACCENT))
+                                .add(egui::Button::new(RichText::new("Send").color(Color32::WHITE).strong()).fill(th.c_accent()).corner_radius(CornerRadius::same(16)))
                                 .clicked()
                             {
                                 self.send_message(&ctx);
@@ -778,16 +794,19 @@ impl eframe::App for YokahuApp {
                         });
                     });
                 });
+                });
             });
 
         // Main Chat Area
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(BG_ROOT).inner_margin(egui::Margin::symmetric(24, 12)))
+            .frame(egui::Frame::NONE.fill(th.c_root()).inner_margin(egui::Margin::symmetric(24, 12)))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.set_max_width(760.0);
                         let chat = &self.state.chats[self.active_chat_idx()];
                         if chat.messages.is_empty() {
                             ui.add_space(40.0);
@@ -796,7 +815,7 @@ impl eframe::App for YokahuApp {
                                     ui.image((tex.id(), egui::vec2(150.0, 150.0)));
                                     ui.add_space(8.0);
                                 }
-                                ui.label(RichText::new("Yokahu Local AI Workspace").size(22.0).strong().color(TEXT));
+                                ui.label(RichText::new("Yokahu Local AI Workspace").size(22.0).strong().color(th.c_text()));
                                 ui.add_space(6.0);
                                 ui.label(
                                     RichText::new(format!(
@@ -806,7 +825,7 @@ impl eframe::App for YokahuApp {
                                         self.mcp_tools.len()
                                     ))
                                     .size(13.0)
-                                    .color(TEXT_MUTED),
+                                    .color(th.c_muted()),
                                 );
                             });
                         } else {
@@ -814,46 +833,46 @@ impl eframe::App for YokahuApp {
                                 if msg.role == "user" {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                                         let bubble = egui::Frame::NONE
-                                            .fill(BG_ELEVATED)
-                                            .stroke(Stroke::new(1.0, BORDER))
+                                            .fill(th.c_elevated())
+                                            .stroke(Stroke::new(1.0, th.c_border()))
                                             .corner_radius(CornerRadius::same(10))
                                             .inner_margin(12.0);
                                         bubble.show(ui, |ui| {
                                             ui.set_max_width(ui.available_width() * 0.78);
-                                            ui.label(RichText::new(&msg.content).color(TEXT));
+                                            ui.label(RichText::new(&msg.content).color(th.c_text()));
                                         });
                                     });
                                 } else if msg.role == "tool" {
                                     egui::CollapsingHeader::new(
                                         RichText::new(format!("Tool result: {}", msg.tool_name))
                                             .size(11.5)
-                                            .color(TEXT_MUTED),
+                                            .color(th.c_muted()),
                                     )
                                     .id_salt(format!("tool_{}", m_idx))
                                     .show(ui, |ui| {
                                         ui.label(
                                             RichText::new(&msg.content)
                                                 .font(FontId::new(12.0, FontFamily::Monospace))
-                                                .color(TEXT_MUTED),
+                                                .color(th.c_muted()),
                                         );
                                     });
                                 } else {
                                     let model_lbl = if msg.model.is_empty() { &self.state.model } else { &msg.model };
-                                    ui.label(RichText::new(model_lbl).size(11.0).color(TEXT_DIM));
+                                    ui.label(RichText::new(model_lbl).size(11.0).color(th.c_muted()));
                                     if !msg.thinking.is_empty() {
                                         egui::CollapsingHeader::new(
-                                            RichText::new("Thought process").size(12.0).color(TEXT_MUTED),
+                                            RichText::new("Thought process").size(12.0).color(th.c_muted()),
                                         )
                                         .id_salt(format!("think_{}", m_idx))
                                         .show(ui, |ui| {
                                             ui.label(
                                                 RichText::new(&msg.thinking)
                                                     .font(FontId::new(12.0, FontFamily::Monospace))
-                                                    .color(TEXT_MUTED),
+                                                    .color(th.c_muted()),
                                             );
                                         });
                                     }
-                                    render_markdown(ui, &ctx, &msg.content);
+                                    render_markdown(ui, &ctx, &th, &msg.content);
                                 }
                                 ui.add_space(12.0);
                             }
@@ -861,7 +880,7 @@ impl eframe::App for YokahuApp {
 
                         if let Some(pending) = self.pending_approval.take() {
                             let card = egui::Frame::NONE
-                                .fill(BG_SURFACE)
+                                .fill(th.c_surface())
                                 .stroke(Stroke::new(1.5, AMBER))
                                 .corner_radius(CornerRadius::same(10))
                                 .inner_margin(12.0);
@@ -876,12 +895,12 @@ impl eframe::App for YokahuApp {
                                 ui.label(
                                     RichText::new(&pending.preview)
                                         .font(FontId::new(12.0, FontFamily::Monospace))
-                                        .color(TEXT_MUTED),
+                                        .color(th.c_muted()),
                                 );
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
                                     if ui
-                                        .add(egui::Button::new(RichText::new("Approve").color(BG_ROOT).strong()).fill(GREEN))
+                                        .add(egui::Button::new(RichText::new("Approve").color(th.c_root()).strong()).fill(GREEN))
                                         .clicked()
                                     {
                                         let _ = pending.reply_tx.send(true);
@@ -900,6 +919,7 @@ impl eframe::App for YokahuApp {
                                 self.pending_approval = Some(pending);
                             }
                         }
+                        });
                     });
             });
 
@@ -1005,7 +1025,7 @@ impl eframe::App for YokahuApp {
                             }
                         });
                         if !self.pull_status.is_empty() {
-                            ui.label(RichText::new(&self.pull_status).size(11.5).color(ACCENT));
+                            ui.label(RichText::new(&self.pull_status).size(11.5).color(th.c_accent()));
                         }
                     }
                     ui.add_space(8.0);
@@ -1030,7 +1050,7 @@ impl eframe::App for YokahuApp {
                     ui.label(
                         RichText::new(format!("Config: {}", mcp_client::config_path().display()))
                             .size(11.0)
-                            .color(TEXT_DIM),
+                            .color(th.c_muted()),
                     );
                     ui.add_space(6.0);
 
@@ -1048,7 +1068,7 @@ impl eframe::App for YokahuApp {
                             } else {
                                 format!("{} {} [env: {}]", scfg.command, scfg.args.join(" "), scfg.env.len())
                             };
-                            ui.label(RichText::new(summary).size(11.5).color(TEXT_MUTED));
+                            ui.label(RichText::new(summary).size(11.5).color(th.c_muted()));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.small_button("Remove").clicked() {
                                     remove_name = Some(name.clone());
@@ -1175,9 +1195,9 @@ impl eframe::App for YokahuApp {
                         egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
                             for t in &self.mcp_tools {
                                 ui.label(
-                                    RichText::new(format!("• {} — {}", t.full_name, t.description))
+                                    RichText::new(format!("\u{2022} {} - {}", t.full_name, t.description))
                                         .size(11.5)
-                                        .color(TEXT_MUTED),
+                                        .color(th.c_muted()),
                                 );
                             }
                         });
@@ -1197,15 +1217,15 @@ impl eframe::App for YokahuApp {
 
         // First-Run Onboarding Modal
         if self.show_onboarding {
-            egui::Window::new("Welcome to Yokahu — Model Setup")
+            egui::Window::new("Welcome to Yokahu â€” Model Setup")
                 .collapsible(false)
                 .resizable(false)
                 .default_width(440.0)
                 .show(&ctx, |ui| {
                     ui.label("No active local model endpoint was detected yet. Choose how you want to run models:");
                     ui.add_space(6.0);
-                    ui.label(RichText::new("1. Ollama (recommended): install Ollama, then pull any model (e.g. qwen3.5:9b, llama3.2).").size(12.0).color(TEXT_MUTED));
-                    ui.label(RichText::new("2. OpenAI-Compatible: point to LM Studio, llama-server, or vLLM.").size(12.0).color(TEXT_MUTED));
+                    ui.label(RichText::new("1. Ollama (recommended): install Ollama, then pull any model (e.g. qwen3.5:9b, llama3.2).").size(12.0).color(th.c_muted()));
+                    ui.label(RichText::new("2. OpenAI-Compatible: point to LM Studio, llama-server, or vLLM.").size(12.0).color(th.c_muted()));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Open Provider / Pull Model...").clicked() {
@@ -1222,15 +1242,70 @@ impl eframe::App for YokahuApp {
                     });
                 });
         }
+
+        // Appearance & Colors Modal
+        if self.show_theme_modal {
+            egui::Window::new("Appearance & UI Colors")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(420.0)
+                .show(&ctx, |ui| {
+                    ui.label(RichText::new("Theme Presets").strong());
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for name in ThemeConfig::presets() {
+                            let selected = self.state.theme.preset_name == *name;
+                            if ui
+                                .selectable_label(selected, *name)
+                                .clicked()
+                            {
+                                self.state.theme = ThemeConfig::preset(name);
+                                theme::apply_theme(&ctx, &self.state.theme);
+                                save_state(&self.state);
+                            }
+                        }
+                    });
+                    ui.separator();
+                    ui.label(RichText::new("Custom Colors").strong());
+                    ui.add_space(4.0);
+                    let mut changed = false;
+                    ui.horizontal(|ui| {
+                        ui.label("th.c_accent():");
+                        changed |= ui.color_edit_button_srgb(&mut self.state.theme.accent).changed();
+                        ui.add_space(10.0);
+                        ui.label("Background:");
+                        changed |= ui.color_edit_button_srgb(&mut self.state.theme.bg_root).changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Sidebar:");
+                        changed |= ui.color_edit_button_srgb(&mut self.state.theme.bg_sidebar).changed();
+                        ui.add_space(10.0);
+                        ui.label("Surface:");
+                        changed |= ui.color_edit_button_srgb(&mut self.state.theme.bg_surface).changed();
+                    });
+                    if ui.checkbox(&mut self.state.theme.is_light, "Light base mode").changed() {
+                        changed = true;
+                    }
+                    if changed {
+                        self.state.theme.preset_name = "Custom".to_string();
+                        theme::apply_theme(&ctx, &self.state.theme);
+                        save_state(&self.state);
+                    }
+                    ui.add_space(8.0);
+                    if ui.button("Close").clicked() {
+                        self.show_theme_modal = false;
+                    }
+                });
+        }
     }
 }
 
-fn render_markdown(ui: &mut egui::Ui, ctx: &egui::Context, text: &str) {
+fn render_markdown(ui: &mut egui::Ui, ctx: &egui::Context, th: &ThemeConfig, text: &str) {
     let mut rest = text;
     while let Some(start) = rest.find("```") {
         let before = &rest[..start];
         if !before.trim().is_empty() {
-            ui.label(RichText::new(before.trim_end()).color(TEXT));
+            ui.label(RichText::new(before.trim_end()).color(th.c_text()));
         }
         let after_ticks = &rest[start + 3..];
         let (lang, code_start) = if let Some(nl) = after_ticks.find('\n') {
@@ -1246,7 +1321,7 @@ fn render_markdown(ui: &mut egui::Ui, ctx: &egui::Context, text: &str) {
 
         let box_frame = egui::Frame::NONE
             .fill(Color32::from_rgb(13, 17, 23))
-            .stroke(Stroke::new(1.0, BORDER))
+            .stroke(Stroke::new(1.0, th.c_border()))
             .corner_radius(CornerRadius::same(8))
             .inner_margin(10.0);
         box_frame.show(ui, |ui| {
@@ -1254,7 +1329,7 @@ fn render_markdown(ui: &mut egui::Ui, ctx: &egui::Context, text: &str) {
                 ui.label(
                     RichText::new(if lang.is_empty() { "code" } else { lang })
                         .size(11.0)
-                        .color(TEXT_MUTED),
+                        .color(th.c_muted()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Copy").clicked() {
@@ -1266,13 +1341,13 @@ fn render_markdown(ui: &mut egui::Ui, ctx: &egui::Context, text: &str) {
             ui.label(
                 RichText::new(code.trim_end())
                     .font(FontId::new(12.5, FontFamily::Monospace))
-                    .color(TEXT),
+                    .color(th.c_text()),
             );
         });
         rest = next_rest;
     }
     if !rest.trim().is_empty() {
-        ui.label(RichText::new(rest.trim_start_matches('\n')).color(TEXT));
+        ui.label(RichText::new(rest.trim_start_matches('\n')).color(th.c_text()));
     }
 }
 
@@ -1743,7 +1818,7 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-        out.push('…');
+        out.push('\u{2026}');
         out
     }
 }
@@ -1754,20 +1829,6 @@ fn sanitize_filename(s: &str) -> String {
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
     if clean.is_empty() { "yokahu_chat".to_string() } else { clean }
-}
-
-fn apply_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = BG_ROOT;
-    visuals.window_fill = BG_SURFACE;
-    visuals.extreme_bg_color = BG_ROOT;
-    visuals.widgets.noninteractive.bg_fill = BG_SURFACE;
-    visuals.widgets.inactive.bg_fill = BG_ELEVATED;
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(35, 43, 62);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(44, 55, 80);
-    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(88, 166, 255, 60);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
-    ctx.set_visuals(visuals);
 }
 
 fn main() -> eframe::Result<()> {
@@ -1783,3 +1844,4 @@ fn main() -> eframe::Result<()> {
     };
     eframe::run_native("Yokahu", opts, Box::new(|cc| Ok(Box::new(YokahuApp::new(cc)))))
 }
+
