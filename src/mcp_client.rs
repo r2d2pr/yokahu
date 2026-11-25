@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 
 #[cfg(windows)]
@@ -271,6 +272,178 @@ pub fn to_tool_schemas(tools: &[DiscoveredMcpTool]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+struct PersistentStdio {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl PersistentStdio {
+    fn spawn(cfg: &McpServerConfig) -> Result<Self, String> {
+        let mut cmd = Command::new(&cfg.command);
+        cmd.args(&cfg.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        for (k, v) in &cfg.env {
+            cmd.env(k, v);
+        }
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn '{}': {}", cfg.command, e))?;
+        let stdin = child.stdin.take().ok_or("Missing stdin")?;
+        let stdout = BufReader::new(child.stdout.take().ok_or("Missing stdout")?);
+        let mut proc = Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+        };
+        proc.initialize()?;
+        Ok(proc)
+    }
+
+    fn initialize(&mut self) -> Result<(), String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let init_req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "yokahu", "version": "0.4.0" }
+            }
+        });
+        let _ = self.rpc(init_req, id)?;
+        let notif = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        writeln!(self.stdin, "{}", notif).map_err(|e| format!("Write error: {}", e))?;
+        self.stdin.flush().map_err(|e| format!("Flush error: {}", e))?;
+        Ok(())
+    }
+
+    fn rpc(&mut self, req: Value, expected_id: u64) -> Result<Value, String> {
+        writeln!(self.stdin, "{}", req).map_err(|e| format!("Write error: {}", e))?;
+        self.stdin.flush().map_err(|e| format!("Flush error: {}", e))?;
+        loop {
+            let mut line = String::new();
+            let n = self.stdout.read_line(&mut line).map_err(|e| format!("Read error: {}", e))?;
+            if n == 0 {
+                return Err("MCP process closed stdout".to_string());
+            }
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(t) {
+                if v.get("id").and_then(|x| x.as_u64()) == Some(expected_id) {
+                    return Ok(v);
+                }
+            }
+        }
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        });
+        self.rpc(req, id)
+    }
+}
+
+impl Drop for PersistentStdio {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub struct McpPool {
+    procs: Mutex<HashMap<String, PersistentStdio>>,
+}
+
+impl Default for McpPool {
+    fn default() -> Self {
+        Self {
+            procs: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl McpPool {
+    pub fn restart_all(&self) {
+        if let Ok(mut map) = self.procs.lock() {
+            map.clear();
+        }
+    }
+
+    pub fn call_tool(&self, cfg: &McpConfigFile, full_name: &str, args: &Value) -> Result<String, String> {
+        let rest = full_name
+            .strip_prefix("mcp__")
+            .ok_or_else(|| format!("Invalid MCP tool name: {}", full_name))?;
+        let (server_name, tool_name) = rest
+            .split_once("__")
+            .ok_or_else(|| format!("Invalid MCP tool name: {}", full_name))?;
+        let scfg = cfg
+            .mcp_servers
+            .get(server_name)
+            .ok_or_else(|| format!("MCP server '{}' not found", server_name))?;
+        if !scfg.enabled {
+            return Err(format!("MCP server '{}' is disabled", server_name));
+        }
+
+        if !scfg.url.trim().is_empty() {
+            return call_mcp_tool(cfg, full_name, args);
+        }
+
+        let mut map = self.procs.lock().map_err(|_| "MCP pool lock poisoned".to_string())?;
+        if !map.contains_key(server_name) {
+            let proc = PersistentStdio::spawn(scfg)?;
+            map.insert(server_name.to_string(), proc);
+        }
+
+        let params = json!({ "name": tool_name, "arguments": args });
+        let resp = match map.get_mut(server_name).unwrap().call("tools/call", params.clone()) {
+            Ok(r) => r,
+            Err(_) => {
+                // Respawn once if persistent child exited
+                let mut proc = PersistentStdio::spawn(scfg)?;
+                let r = proc.call("tools/call", params)?;
+                map.insert(server_name.to_string(), proc);
+                r
+            }
+        };
+
+        if let Some(err) = resp.get("error") {
+            return Err(format!("MCP error: {}", err));
+        }
+        let content = resp
+            .get("result")
+            .and_then(|r| r.get("content"))
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| resp.to_string());
+        Ok(content)
+    }
 }
 
 pub fn call_mcp_tool(cfg: &McpConfigFile, full_name: &str, args: &Value) -> Result<String, String> {

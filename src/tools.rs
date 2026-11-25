@@ -140,15 +140,113 @@ pub fn preview_tool(name: &str, args: &Value) -> String {
         "write_file" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let preview: String = content.lines().take(20).collect::<Vec<_>>().join("\n");
-            let total_lines = content.lines().count();
-            format!("Write file: {}\n({} lines)\n---\n{}", path, total_lines, preview)
+            format!("Write file: {} ({} lines)", path, content.lines().count())
         }
         "run_command" => {
             let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             format!("Run PowerShell:\n{}", cmd)
         }
         _ => format!("{}({})", name, args),
+    }
+}
+
+pub fn compute_write_diff(workspace: Option<&Path>, args: &Value) -> Vec<(char, String)> {
+    let raw = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let new_content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let path = resolve_path(workspace, raw);
+    let old_content = fs::read_to_string(&path).unwrap_or_default();
+
+    let old_lines: Vec<&str> = old_content.lines().collect();
+    let new_lines: Vec<&str> = new_content.lines().collect();
+    let mut diff = Vec::new();
+
+    if old_lines.is_empty() {
+        for l in new_lines.iter().take(40) {
+            diff.push(('+', (*l).to_string()));
+        }
+        return diff;
+    }
+
+    // Simple LCS/prefix-suffix diff for crisp approval preview
+    let mut pref = 0;
+    while pref < old_lines.len() && pref < new_lines.len() && old_lines[pref] == new_lines[pref] {
+        pref += 1;
+    }
+    let mut suf = 0;
+    while suf < (old_lines.len() - pref)
+        && suf < (new_lines.len() - pref)
+        && old_lines[old_lines.len() - 1 - suf] == new_lines[new_lines.len() - 1 - suf]
+    {
+        suf += 1;
+    }
+
+    let ctx_start = pref.saturating_sub(2);
+    for l in &old_lines[ctx_start..pref] {
+        diff.push((' ', (*l).to_string()));
+    }
+    for l in &old_lines[pref..old_lines.len() - suf] {
+        diff.push(('-', (*l).to_string()));
+        if diff.len() >= 50 {
+            return diff;
+        }
+    }
+    for l in &new_lines[pref..new_lines.len() - suf] {
+        diff.push(('+', (*l).to_string()));
+        if diff.len() >= 50 {
+            return diff;
+        }
+    }
+    let ctx_end = (old_lines.len() - suf + 2).min(old_lines.len());
+    for l in &old_lines[old_lines.len() - suf..ctx_end] {
+        diff.push((' ', (*l).to_string()));
+    }
+    diff
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub depth: usize,
+}
+
+pub fn list_workspace_tree(root: &Path) -> Vec<WorkspaceEntry> {
+    let mut out = Vec::new();
+    walk_tree(root, 0, &mut out);
+    out
+}
+
+fn walk_tree(dir: &Path, depth: usize, out: &mut Vec<WorkspaceEntry>) {
+    if depth > 4 || out.len() >= 300 {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| {
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        (!is_dir, e.file_name().to_string_lossy().to_lowercase())
+    });
+
+    for entry in entries {
+        if out.len() >= 300 {
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if matches!(name.as_str(), ".git" | "target" | "node_modules") {
+            continue;
+        }
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        out.push(WorkspaceEntry {
+            name,
+            path: path.clone(),
+            is_dir,
+            depth,
+        });
+        if is_dir {
+            walk_tree(&path, depth + 1, out);
+        }
     }
 }
 

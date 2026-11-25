@@ -1,10 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, RichText, Stroke};
-use yokahu::mcp_client::{self, DiscoveredMcpTool, McpConfigFile, McpServerConfig};
+use yokahu::markdown;
+use yokahu::mcp_client::{self, DiscoveredMcpTool, McpConfigFile, McpPool, McpServerConfig};
 use yokahu::ollama;
 use yokahu::theme::{self, ThemeConfig};
-use yokahu::tools::{self, SafetyMode};
+use yokahu::tools::{self, SafetyMode, WorkspaceEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -16,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GREEN: Color32 = Color32::from_rgb(63, 185, 80);
 const RED: Color32 = Color32::from_rgb(248, 81, 73);
@@ -114,9 +115,17 @@ impl Default for PersistedState {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarTab {
+    Chats,
+    Files,
+    Settings,
+}
+
 struct PendingApproval {
     tool_name: String,
     preview: String,
+    diff_lines: Vec<(char, String)>,
     reply_tx: Sender<bool>,
 }
 
@@ -166,6 +175,12 @@ struct YokahuApp {
     show_onboarding: bool,
     show_theme_modal: bool,
     show_sidebar: bool,
+    sidebar_tab: SidebarTab,
+    workspace_tree: Vec<WorkspaceEntry>,
+    mcp_pool: Arc<McpPool>,
+    tok_count: usize,
+    gen_start: Option<Instant>,
+    last_tok_per_sec: f32,
     logo_tex: Option<egui::TextureHandle>,
     status_note: String,
 }
@@ -200,6 +215,12 @@ impl YokahuApp {
             cc.egui_ctx.load_texture("yokahu_emblem", color_img, egui::TextureOptions::LINEAR)
         });
 
+        let workspace_tree = state
+            .workspace
+            .as_deref()
+            .map(|w| tools::list_workspace_tree(Path::new(w)))
+            .unwrap_or_default();
+
         let mut app = Self {
             sys_draft: state.system_prompt.clone(),
             state,
@@ -233,6 +254,12 @@ impl YokahuApp {
             show_onboarding: false,
             show_theme_modal: false,
             show_sidebar: true,
+            sidebar_tab: SidebarTab::Chats,
+            workspace_tree,
+            mcp_pool: Arc::new(McpPool::default()),
+            tok_count: 0,
+            gen_start: None,
+            last_tok_per_sec: 0.0,
             logo_tex,
             status_note: String::new(),
         };
@@ -341,9 +368,15 @@ impl YokahuApp {
         self.prompt_input.clear();
         self.attachments.clear();
         self.busy = true;
+        self.tok_count = 0;
+        self.gen_start = Some(Instant::now());
+        self.last_tok_per_sec = 0.0;
         self.cancel_flag.store(false, Ordering::Relaxed);
         save_state(&self.state);
+        self.spawn_worker(ctx, idx);
+    }
 
+    fn spawn_worker(&self, ctx: &egui::Context, idx: usize) {
         let history = self.state.chats[idx].messages[..self.state.chats[idx].messages.len() - 1].to_vec();
         let prov = self.state.provider;
         let base_url = self.state.base_url.clone();
@@ -358,6 +391,7 @@ impl YokahuApp {
         let safety = self.state.safety_mode;
         let mcp_cfg = self.mcp_cfg.clone();
         let mcp_tools = self.mcp_tools.clone();
+        let mcp_pool = self.mcp_pool.clone();
         let tx = self.tx.clone();
         let cancel = self.cancel_flag.clone();
         let ctx_clone = ctx.clone();
@@ -365,9 +399,32 @@ impl YokahuApp {
         thread::spawn(move || {
             run_agent_loop(
                 history, prov, base_url, api_key, model, system, think, temp, num_ctx, keep_alive,
-                workspace, safety, mcp_cfg, mcp_tools, tx, cancel, ctx_clone,
+                workspace, safety, mcp_cfg, mcp_tools, mcp_pool, tx, cancel, ctx_clone,
             );
         });
+    }
+
+    fn regenerate_at(&mut self, ctx: &egui::Context, msg_idx: usize) {
+        if self.busy || self.state.chats.is_empty() {
+            return;
+        }
+        let idx = self.active_chat_idx();
+        self.state.chats[idx].messages.truncate(msg_idx);
+        self.state.chats[idx].messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            thinking: String::new(),
+            model: self.state.model.clone(),
+            images: Vec::new(),
+            tool_name: String::new(),
+        });
+        self.busy = true;
+        self.tok_count = 0;
+        self.gen_start = Some(Instant::now());
+        self.last_tok_per_sec = 0.0;
+        self.cancel_flag.store(false, Ordering::Relaxed);
+        save_state(&self.state);
+        self.spawn_worker(ctx, idx);
     }
 
     fn export_active_chat(&mut self, as_json: bool) {
@@ -429,6 +486,11 @@ impl eframe::App for YokahuApp {
                     }
                 }
                 WorkerEvent::Thinking(chunk) => {
+                    self.tok_count += 1;
+                    if let Some(st) = self.gen_start {
+                        let secs = st.elapsed().as_secs_f32().max(0.05);
+                        self.last_tok_per_sec = self.tok_count as f32 / secs;
+                    }
                     if !self.state.chats.is_empty() {
                         let idx = self.active_chat_idx();
                         if let Some(last) = self.state.chats[idx].messages.last_mut() {
@@ -437,6 +499,11 @@ impl eframe::App for YokahuApp {
                     }
                 }
                 WorkerEvent::Token(chunk) => {
+                    self.tok_count += 1;
+                    if let Some(st) = self.gen_start {
+                        let secs = st.elapsed().as_secs_f32().max(0.05);
+                        self.last_tok_per_sec = self.tok_count as f32 / secs;
+                    }
                     if !self.state.chats.is_empty() {
                         let idx = self.active_chat_idx();
                         if let Some(last) = self.state.chats[idx].messages.last_mut() {
@@ -518,164 +585,193 @@ impl eframe::App for YokahuApp {
                             });
                         });
                     });
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Chats, "Chats");
+                        ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Files, "Files");
+                        ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Settings, "Settings");
+                    });
+                    ui.separator();
+                    ui.add_space(4.0);
 
-                if ui
-                    .add_sized([ui.available_width(), 30.0], egui::Button::new("+ New Conversation"))
-                    .clicked()
-                {
-                    self.new_chat();
-                }
-                ui.add_space(6.0);
-
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.history_filter)
-                        .hint_text("Search history...")
-                        .desired_width(ui.available_width()),
-                );
-                ui.add_space(6.0);
-
-                let list_h = (ui.available_height() - 345.0).max(80.0);
-                egui::ScrollArea::vertical().max_height(list_h).show(ui, |ui| {
-                    let filter = self.history_filter.to_lowercase();
-                    let active_id = self.state.active_id.clone();
-                    let mut switch_to: Option<String> = None;
-                    let mut delete_id: Option<String> = None;
-
-                    for c in &self.state.chats {
-                        if !filter.is_empty() && !c.title.to_lowercase().contains(&filter) {
-                            continue;
-                        }
-                        let is_active = active_id.as_deref() == Some(c.id.as_str());
-                        ui.horizontal(|ui| {
-                            if ui.selectable_label(is_active, truncate(&c.title, 26)).clicked() {
-                                switch_to = Some(c.id.clone());
+                    match self.sidebar_tab {
+                        SidebarTab::Chats => {
+                            if ui
+                                .add_sized([ui.available_width(), 30.0], egui::Button::new("+ New Conversation"))
+                                .clicked()
+                            {
+                                self.new_chat();
                             }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("x").clicked() {
-                                    delete_id = Some(c.id.clone());
+                            ui.add_space(6.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.history_filter)
+                                    .hint_text("Search history...")
+                                    .desired_width(ui.available_width()),
+                            );
+                            ui.add_space(6.0);
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                let filter = self.history_filter.to_lowercase();
+                                let active_id = self.state.active_id.clone();
+                                let mut switch_to: Option<String> = None;
+                                let mut delete_id: Option<String> = None;
+
+                                for c in &self.state.chats {
+                                    if !filter.is_empty() && !c.title.to_lowercase().contains(&filter) {
+                                        continue;
+                                    }
+                                    let is_active = active_id.as_deref() == Some(c.id.as_str());
+                                    ui.horizontal(|ui| {
+                                        if ui.selectable_label(is_active, truncate(&c.title, 26)).clicked() {
+                                            switch_to = Some(c.id.clone());
+                                        }
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.small_button("x").clicked() {
+                                                delete_id = Some(c.id.clone());
+                                            }
+                                        });
+                                    });
+                                }
+                                if let Some(id) = switch_to {
+                                    self.state.active_id = Some(id);
+                                    save_state(&self.state);
+                                }
+                                if let Some(id) = delete_id {
+                                    self.state.chats.retain(|c| c.id != id);
+                                    if self.state.chats.is_empty() {
+                                        self.new_chat();
+                                    } else if self.state.active_id.as_deref() == Some(id.as_str()) {
+                                        self.state.active_id = Some(self.state.chats[0].id.clone());
+                                    }
+                                    save_state(&self.state);
                                 }
                             });
-                        });
-                    }
-                    if let Some(id) = switch_to {
-                        self.state.active_id = Some(id);
-                        save_state(&self.state);
-                    }
-                    if let Some(id) = delete_id {
-                        self.state.chats.retain(|c| c.id != id);
-                        if self.state.chats.is_empty() {
-                            self.new_chat();
-                        } else if self.state.active_id.as_deref() == Some(id.as_str()) {
-                            self.state.active_id = Some(self.state.chats[0].id.clone());
                         }
-                        save_state(&self.state);
-                    }
-                });
-
-                ui.separator();
-                ui.add_space(4.0);
-
-                // Workspace
-                ui.label(RichText::new("Workspace").size(11.5).color(th.c_muted()));
-                ui.horizontal(|ui| {
-                    if ui.button("Select Folder...").clicked() {
-                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                            self.state.workspace = Some(dir.display().to_string());
-                            save_state(&self.state);
+                        SidebarTab::Files => {
+                            ui.horizontal(|ui| {
+                                if ui.button("Select Folder...").clicked() {
+                                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                        self.workspace_tree = tools::list_workspace_tree(&dir);
+                                        self.state.workspace = Some(dir.display().to_string());
+                                        save_state(&self.state);
+                                    }
+                                }
+                                if self.state.workspace.is_some() {
+                                    if ui.button("Refresh").clicked() {
+                                        if let Some(w) = &self.state.workspace {
+                                            self.workspace_tree = tools::list_workspace_tree(Path::new(w));
+                                        }
+                                    }
+                                    if ui.button("Clear").clicked() {
+                                        self.state.workspace = None;
+                                        self.workspace_tree.clear();
+                                        save_state(&self.state);
+                                    }
+                                }
+                            });
+                            let ws_label = self.state.workspace.as_deref().unwrap_or("No workspace selected");
+                            ui.label(RichText::new(truncate(ws_label, 36)).size(11.0).color(th.c_muted()));
+                            ui.add_space(6.0);
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for entry in &self.workspace_tree {
+                                    let indent = "  ".repeat(entry.depth);
+                                    let label = if entry.is_dir {
+                                        format!("{}{}/", indent, entry.name)
+                                    } else {
+                                        format!("{}{}", indent, entry.name)
+                                    };
+                                    if entry.is_dir {
+                                        ui.label(RichText::new(label).size(12.0).color(th.c_muted()));
+                                    } else if ui
+                                        .selectable_label(false, RichText::new(label).size(12.0).color(th.c_text()))
+                                        .clicked()
+                                    {
+                                        if let Some(att) = read_attachment(&entry.path) {
+                                            self.attachments.push(att);
+                                        }
+                                    }
+                                }
+                            });
                         }
-                    }
-                    if self.state.workspace.is_some() && ui.button("Clear").clicked() {
-                        self.state.workspace = None;
-                        save_state(&self.state);
-                    }
-                });
-                let ws_label = self.state.workspace.as_deref().unwrap_or("None (Chat only)");
-                ui.label(RichText::new(truncate(ws_label, 36)).size(11.0).color(th.c_muted()));
-                ui.add_space(4.0);
+                        SidebarTab::Settings => {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.label(RichText::new("Model & Provider").size(12.0).strong().color(th.c_text()));
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(egui::TextEdit::singleline(&mut self.state.model).desired_width(155.0))
+                                        .changed()
+                                    {
+                                        save_state(&self.state);
+                                    }
+                                    egui::ComboBox::from_id_salt("model_pick")
+                                        .selected_text("Pick")
+                                        .width(68.0)
+                                        .show_ui(ui, |ui| {
+                                            for m in &self.models {
+                                                if ui.selectable_value(&mut self.state.model, m.clone(), m).changed() {
+                                                    save_state(&self.state);
+                                                }
+                                            }
+                                        });
+                                });
+                                if ui.button("Provider & Pull Model...").clicked() {
+                                    self.show_provider_modal = true;
+                                }
+                                ui.add_space(8.0);
+                                ui.separator();
 
-                // Safety Mode
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Safety:").size(12.0).color(th.c_muted()));
-                    egui::ComboBox::from_id_salt("safety_combo")
-                        .selected_text(self.state.safety_mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in [SafetyMode::Safe, SafetyMode::ReadOnly, SafetyMode::AutoApprove] {
-                                if ui.selectable_value(&mut self.state.safety_mode, mode, mode.label()).changed() {
+                                ui.label(RichText::new("Agent Safety").size(12.0).strong().color(th.c_text()));
+                                egui::ComboBox::from_id_salt("safety_combo")
+                                    .selected_text(self.state.safety_mode.label())
+                                    .show_ui(ui, |ui| {
+                                        for mode in [SafetyMode::Safe, SafetyMode::ReadOnly, SafetyMode::AutoApprove] {
+                                            if ui.selectable_value(&mut self.state.safety_mode, mode, mode.label()).changed() {
+                                                save_state(&self.state);
+                                            }
+                                        }
+                                    });
+                                ui.add_space(8.0);
+                                ui.separator();
+
+                                ui.label(RichText::new("Generation").size(12.0).strong().color(th.c_text()));
+                                if ui.checkbox(&mut self.state.think, "Thinking mode").changed() {
                                     save_state(&self.state);
                                 }
-                            }
-                        });
-                });
-
-                // Model + Provider button
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Model:").size(12.0).color(th.c_muted()));
-                    if ui.small_button("Provider / Pull...").clicked() {
-                        self.show_provider_modal = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut self.state.model).desired_width(155.0))
-                        .changed()
-                    {
-                        save_state(&self.state);
-                    }
-                    egui::ComboBox::from_id_salt("model_pick")
-                        .selected_text("Pick")
-                        .width(68.0)
-                        .show_ui(ui, |ui| {
-                            for m in &self.models {
-                                if ui.selectable_value(&mut self.state.model, m.clone(), m).changed() {
+                                ui.label(RichText::new(format!("Temperature: {:.1}", self.state.temperature)).size(11.5).color(th.c_muted()));
+                                if ui
+                                    .add(egui::Slider::new(&mut self.state.temperature, 0.0..=1.0).show_value(false))
+                                    .changed()
+                                {
                                     save_state(&self.state);
                                 }
-                            }
-                        });
-                });
+                                ui.label(RichText::new(format!("Context (num_ctx): {}", self.state.num_ctx)).size(11.5).color(th.c_muted()));
+                                if ui
+                                    .add(egui::Slider::new(&mut self.state.num_ctx, 2048..=32768).step_by(1024.0).show_value(false))
+                                    .changed()
+                                {
+                                    save_state(&self.state);
+                                }
+                                ui.add_space(8.0);
+                                ui.separator();
 
-                // Thinking + Temp
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut self.state.think, "Thinking").changed() {
-                        save_state(&self.state);
-                    }
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(format!("Temp: {:.1}", self.state.temperature)).size(11.5).color(th.c_muted()));
-                });
-                if ui
-                    .add(egui::Slider::new(&mut self.state.temperature, 0.0..=1.0).show_value(false))
-                    .changed()
-                {
-                    save_state(&self.state);
-                }
-
-                // num_ctx + keep_alive
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Ctx: {}", self.state.num_ctx)).size(11.5).color(th.c_muted()));
-                    if ui
-                        .add(egui::Slider::new(&mut self.state.num_ctx, 2048..=32768).step_by(1024.0).show_value(false))
-                        .changed()
-                    {
-                        save_state(&self.state);
+                                ui.label(RichText::new("Integrations & UI").size(12.0).strong().color(th.c_text()));
+                                if ui.add_sized([ui.available_width(), 28.0], egui::Button::new(format!("MCP Servers ({} tools)...", self.mcp_tools.len()))).clicked() {
+                                    self.show_mcp_modal = true;
+                                }
+                                if ui.add_sized([ui.available_width(), 28.0], egui::Button::new("Restart MCP Processes")).clicked() {
+                                    self.mcp_pool.restart_all();
+                                    self.status_note = "MCP processes restarted".to_string();
+                                }
+                                if ui.add_sized([ui.available_width(), 28.0], egui::Button::new("System Prompt...")).clicked() {
+                                    self.sys_draft = self.state.system_prompt.clone();
+                                    self.show_sys_modal = true;
+                                }
+                                if ui.add_sized([ui.available_width(), 28.0], egui::Button::new("Appearance & Colors...")).clicked() {
+                                    self.show_theme_modal = true;
+                                }
+                            });
+                        }
                     }
                 });
-
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(format!("MCP ({})", self.mcp_tools.len()))
-                        .clicked()
-                    {
-                        self.show_mcp_modal = true;
-                    }
-                    if ui.button("System").clicked() {
-                        self.sys_draft = self.state.system_prompt.clone();
-                        self.show_sys_modal = true;
-                    }
-                    if ui.button("Colors").clicked() {
-                        self.show_theme_modal = true;
-                    }
-                });
-            });
         }
 
         // Topbar
@@ -776,7 +872,19 @@ impl eframe::App for YokahuApp {
                                 }
                             }
                         }
-                        ui.label(RichText::new("Drag & drop supported").size(11.0).color(th.c_muted()));
+                        let est_chars: usize = self
+                            .state
+                            .chats
+                            .get(self.active_chat_idx())
+                            .map(|c| c.messages.iter().map(|m| m.content.len() + m.thinking.len()).sum())
+                            .unwrap_or(0);
+                        let est_toks = (est_chars / 4).max(1);
+                        let speed_str = if self.last_tok_per_sec > 0.0 {
+                            format!("  |  {:.1} tok/s  |  ~{}/{} ctx", self.last_tok_per_sec, est_toks, self.state.num_ctx)
+                        } else {
+                            format!("  |  ~{}/{} ctx", est_toks, self.state.num_ctx)
+                        };
+                        ui.label(RichText::new(format!("Drag & drop supported{}", speed_str)).size(11.0).color(th.c_muted()));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if self.busy {
                                 if ui
@@ -829,18 +937,30 @@ impl eframe::App for YokahuApp {
                                 );
                             });
                         } else {
-                            for (m_idx, msg) in chat.messages.iter().enumerate() {
+                            let msgs_snapshot = chat.messages.clone();
+                            let mut edit_user_idx: Option<usize> = None;
+                            let mut regen_idx: Option<usize> = None;
+
+                            for (m_idx, msg) in msgs_snapshot.iter().enumerate() {
                                 if msg.role == "user" {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                                         let bubble = egui::Frame::NONE
                                             .fill(th.c_elevated())
                                             .stroke(Stroke::new(1.0, th.c_border()))
-                                            .corner_radius(CornerRadius::same(10))
+                                            .corner_radius(CornerRadius::same(12))
                                             .inner_margin(12.0);
                                         bubble.show(ui, |ui| {
                                             ui.set_max_width(ui.available_width() * 0.78);
                                             ui.label(RichText::new(&msg.content).color(th.c_text()));
                                         });
+                                    });
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                                        if ui.small_button("Edit").clicked() && !self.busy {
+                                            edit_user_idx = Some(m_idx);
+                                        }
+                                        if ui.small_button("Copy").clicked() {
+                                            ctx.copy_text(msg.content.clone());
+                                        }
                                     });
                                 } else if msg.role == "tool" {
                                     egui::CollapsingHeader::new(
@@ -858,7 +978,17 @@ impl eframe::App for YokahuApp {
                                     });
                                 } else {
                                     let model_lbl = if msg.model.is_empty() { &self.state.model } else { &msg.model };
-                                    ui.label(RichText::new(model_lbl).size(11.0).color(th.c_muted()));
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(model_lbl).size(11.0).color(th.c_muted()));
+                                        if !self.busy {
+                                            if ui.small_button("Copy").clicked() {
+                                                ctx.copy_text(msg.content.clone());
+                                            }
+                                            if ui.small_button("Regenerate").clicked() {
+                                                regen_idx = Some(m_idx);
+                                            }
+                                        }
+                                    });
                                     if !msg.thinking.is_empty() {
                                         egui::CollapsingHeader::new(
                                             RichText::new("Thought process").size(12.0).color(th.c_muted()),
@@ -872,9 +1002,19 @@ impl eframe::App for YokahuApp {
                                             );
                                         });
                                     }
-                                    render_markdown(ui, &ctx, &th, &msg.content);
+                                    markdown::render_markdown(ui, &ctx, &th, &msg.content);
                                 }
                                 ui.add_space(12.0);
+                            }
+
+                            if let Some(u_idx) = edit_user_idx {
+                                let c_idx = self.active_chat_idx();
+                                self.prompt_input = self.state.chats[c_idx].messages[u_idx].content.clone();
+                                self.state.chats[c_idx].messages.truncate(u_idx);
+                                save_state(&self.state);
+                            }
+                            if let Some(r_idx) = regen_idx {
+                                self.regenerate_at(&ctx, r_idx);
                             }
                         }
 
@@ -882,7 +1022,7 @@ impl eframe::App for YokahuApp {
                             let card = egui::Frame::NONE
                                 .fill(th.c_surface())
                                 .stroke(Stroke::new(1.5, AMBER))
-                                .corner_radius(CornerRadius::same(10))
+                                .corner_radius(CornerRadius::same(12))
                                 .inner_margin(12.0);
                             let mut decided = false;
                             card.show(ui, |ui| {
@@ -897,6 +1037,23 @@ impl eframe::App for YokahuApp {
                                         .font(FontId::new(12.0, FontFamily::Monospace))
                                         .color(th.c_muted()),
                                 );
+                                if !pending.diff_lines.is_empty() {
+                                    ui.add_space(6.0);
+                                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                                        for (kind, line) in &pending.diff_lines {
+                                            let col = match kind {
+                                                '+' => GREEN,
+                                                '-' => RED,
+                                                _ => th.c_muted(),
+                                            };
+                                            ui.label(
+                                                RichText::new(format!("{} {}", kind, line))
+                                                    .font(FontId::new(12.0, FontFamily::Monospace))
+                                                    .color(col),
+                                            );
+                                        }
+                                    });
+                                }
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
                                     if ui
@@ -1208,6 +1365,10 @@ impl eframe::App for YokahuApp {
                         if ui.button("Refresh Tools").clicked() {
                             self.refresh_mcp(&ctx);
                         }
+                        if ui.button("Restart MCP").clicked() {
+                            self.mcp_pool.restart_all();
+                            self.refresh_mcp(&ctx);
+                        }
                         if ui.button("Close").clicked() {
                             self.show_mcp_modal = false;
                         }
@@ -1297,57 +1458,6 @@ impl eframe::App for YokahuApp {
                     }
                 });
         }
-    }
-}
-
-fn render_markdown(ui: &mut egui::Ui, ctx: &egui::Context, th: &ThemeConfig, text: &str) {
-    let mut rest = text;
-    while let Some(start) = rest.find("```") {
-        let before = &rest[..start];
-        if !before.trim().is_empty() {
-            ui.label(RichText::new(before.trim_end()).color(th.c_text()));
-        }
-        let after_ticks = &rest[start + 3..];
-        let (lang, code_start) = if let Some(nl) = after_ticks.find('\n') {
-            (after_ticks[..nl].trim(), &after_ticks[nl + 1..])
-        } else {
-            ("", after_ticks)
-        };
-        let (code, next_rest) = if let Some(end) = code_start.find("```") {
-            (&code_start[..end], &code_start[end + 3..])
-        } else {
-            (code_start, "")
-        };
-
-        let box_frame = egui::Frame::NONE
-            .fill(Color32::from_rgb(13, 17, 23))
-            .stroke(Stroke::new(1.0, th.c_border()))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(10.0);
-        box_frame.show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(if lang.is_empty() { "code" } else { lang })
-                        .size(11.0)
-                        .color(th.c_muted()),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Copy").clicked() {
-                        ctx.copy_text(code.to_string());
-                    }
-                });
-            });
-            ui.separator();
-            ui.label(
-                RichText::new(code.trim_end())
-                    .font(FontId::new(12.5, FontFamily::Monospace))
-                    .color(th.c_text()),
-            );
-        });
-        rest = next_rest;
-    }
-    if !rest.trim().is_empty() {
-        ui.label(RichText::new(rest.trim_start_matches('\n')).color(th.c_text()));
     }
 }
 
@@ -1542,6 +1652,7 @@ fn run_agent_loop(
     safety: SafetyMode,
     mcp_cfg: McpConfigFile,
     mcp_tools: Vec<DiscoveredMcpTool>,
+    mcp_pool: Arc<McpPool>,
     tx: Sender<WorkerEvent>,
     cancel: Arc<AtomicBool>,
     ctx: egui::Context,
@@ -1720,10 +1831,16 @@ fn run_agent_loop(
                         } else {
                             tools::preview_tool(name, &args)
                         };
+                        let diff_lines = if name == "write_file" {
+                            tools::compute_write_diff(workspace.as_deref(), &args)
+                        } else {
+                            Vec::new()
+                        };
                         let (rtx, rrx) = mpsc::channel();
                         let _ = tx.send(WorkerEvent::NeedApproval(PendingApproval {
                             tool_name: name.to_string(),
                             preview,
+                            diff_lines,
                             reply_tx: rtx,
                         }));
                         ctx.request_repaint();
@@ -1736,7 +1853,8 @@ fn run_agent_loop(
             let output = if !allowed {
                 format!("Tool '{}' denied by user or Read-Only mode.", name)
             } else if is_mcp {
-                mcp_client::call_mcp_tool(&mcp_cfg, name, &args)
+                mcp_pool
+                    .call_tool(&mcp_cfg, name, &args)
                     .unwrap_or_else(|e| format!("MCP error: {}", e))
             } else {
                 tools::execute_tool(workspace.as_deref(), name, &args)
