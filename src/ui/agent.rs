@@ -120,6 +120,13 @@ pub fn run_agent_loop(
     let mut api_msgs: Vec<Value> = Vec::new();
     let mut sys_full = system;
     if let Some(ws) = &workspace {
+        let mem_path = ws.join(".yokahu.md");
+        if let Ok(mem) = std::fs::read_to_string(&mem_path) {
+            let trimmed: String = mem.chars().take(12000).collect();
+            if !trimmed.trim().is_empty() {
+                sys_full.push_str(&format!("\n\n--- Project Memory (.yokahu.md) ---\n{}", trimmed));
+            }
+        }
         sys_full.push_str(&format!(
             "\nActive workspace directory: {}\nYou have workspace tools (list_dir, read_file, search_files, write_file, run_command).",
             ws.display()
@@ -369,4 +376,90 @@ pub fn run_agent_loop(
 
     let _ = tx.send(WorkerEvent::Done);
     ctx.request_repaint();
+}
+
+pub fn run_compare_stream(
+    history: Vec<ChatMessage>,
+    prov: ProviderKind,
+    base_url: String,
+    api_key: String,
+    model: String,
+    system: String,
+    temp: f32,
+    num_ctx: i64,
+    keep_alive: String,
+    tx: Sender<WorkerEvent>,
+    cancel: Arc<AtomicBool>,
+    ctx: egui::Context,
+) {
+    let mut api_msgs: Vec<Value> = Vec::new();
+    if !system.trim().is_empty() {
+        api_msgs.push(json!({ "role": "system", "content": system }));
+    }
+    for m in history {
+        if m.role == "user" || m.role == "assistant" {
+            api_msgs.push(json!({ "role": m.role, "content": m.content }));
+        }
+    }
+    let (subpath, payload) = match prov {
+        ProviderKind::Ollama => (
+            "/api/chat",
+            json!({
+                "model": model,
+                "messages": api_msgs,
+                "stream": true,
+                "keep_alive": keep_alive,
+                "options": { "temperature": temp, "num_ctx": num_ctx }
+            })
+            .to_string(),
+        ),
+        ProviderKind::OpenAiCompat => (
+            "/chat/completions",
+            json!({ "model": model, "messages": api_msgs, "stream": true, "temperature": temp }).to_string(),
+        ),
+    };
+    let url = build_url(&base_url, subpath);
+    let mut req = agent().post(&url).header("Content-Type", "application/json");
+    if !api_key.trim().is_empty() {
+        req = req.header("Authorization", &format!("Bearer {}", api_key.trim()));
+    }
+    if let Ok(resp) = req.send(payload.as_str()) {
+        let reader = BufReader::new(resp.into_body().into_reader());
+        for line in reader.lines().flatten() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut one = line.trim().to_string();
+            if one.is_empty() {
+                continue;
+            }
+            if prov == ProviderKind::OpenAiCompat {
+                if let Some(s) = one.strip_prefix("data:") {
+                    one = s.trim().to_string();
+                } else {
+                    continue;
+                }
+                if one == "[DONE]" {
+                    break;
+                }
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(&one) {
+                let tok = match prov {
+                    ProviderKind::Ollama => v.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()),
+                    ProviderKind::OpenAiCompat => v
+                        .get("choices")
+                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get("delta"))
+                        .and_then(|d| d.get("content"))
+                        .and_then(|c| c.as_str()),
+                };
+                if let Some(t) = tok {
+                    if !t.is_empty() {
+                        let _ = tx.send(WorkerEvent::CompareToken(t.to_string()));
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+    }
 }

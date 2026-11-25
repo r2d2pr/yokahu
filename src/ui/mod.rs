@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod icons;
 pub mod modals;
 
 use crate::markdown;
@@ -97,6 +98,10 @@ pub struct ChatMessage {
     pub images: Vec<String>,
     #[serde(default)]
     pub tool_name: String,
+    #[serde(default)]
+    pub compare_model: String,
+    #[serde(default)]
+    pub compare_content: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -129,6 +134,12 @@ pub struct PersistedState {
     pub personas: Vec<Persona>,
     #[serde(default)]
     pub active_persona: String,
+    #[serde(default)]
+    pub compare_enabled: bool,
+    #[serde(default)]
+    pub compare_model: String,
+    #[serde(default)]
+    pub whisper_cli: String,
 }
 
 impl Default for PersistedState {
@@ -150,6 +161,9 @@ impl Default for PersistedState {
             theme: ThemeConfig::default(),
             personas: default_personas(),
             active_persona: "General".to_string(),
+            compare_enabled: false,
+            compare_model: "qwen2.5-coder:7b-instruct-q6_K".to_string(),
+            whisper_cli: "whisper".to_string(),
         }
     }
 }
@@ -174,6 +188,8 @@ pub enum WorkerEvent {
     PullStatus(String, bool),
     Thinking(String),
     Token(String),
+    CompareToken(String),
+    Transcript(String),
     ToolStart(String),
     ToolResult { name: String, output: String },
     NeedApproval(PendingApproval),
@@ -408,7 +424,14 @@ impl YokahuApp {
             model: String::new(),
             images,
             tool_name: String::new(),
+            compare_model: String::new(),
+            compare_content: String::new(),
         });
+        let cmp_model = if self.state.compare_enabled && !self.state.compare_model.trim().is_empty() {
+            self.state.compare_model.clone()
+        } else {
+            String::new()
+        };
         self.state.chats[idx].messages.push(ChatMessage {
             role: "assistant".to_string(),
             content: String::new(),
@@ -416,6 +439,8 @@ impl YokahuApp {
             model: self.state.model.clone(),
             images: Vec::new(),
             tool_name: String::new(),
+            compare_model: cmp_model,
+            compare_content: String::new(),
         });
 
         self.prompt_input.clear();
@@ -449,12 +474,49 @@ impl YokahuApp {
         let cancel = self.cancel_flag.clone();
         let ctx_clone = ctx.clone();
 
+        let tx_cmp = self.tx.clone();
+        let cancel_cmp = self.cancel_flag.clone();
+        let ctx_cmp = ctx.clone();
+        let cmp_enabled = self.state.compare_enabled && !self.state.compare_model.trim().is_empty();
+        let cmp_model = self.state.compare_model.clone();
+        let cmp_hist = history.clone();
+        let cmp_url = base_url.clone();
+        let cmp_key = api_key.clone();
+        let cmp_sys = system.clone();
+        let cmp_ka = keep_alive.clone();
+
         thread::spawn(move || {
             agent::run_agent_loop(
                 history, prov, base_url, api_key, model, system, think, temp, num_ctx, keep_alive,
                 workspace, safety, mcp_cfg, mcp_tools, mcp_pool, tx, cancel, ctx_clone,
             );
         });
+        if cmp_enabled {
+            thread::spawn(move || {
+                agent::run_compare_stream(
+                    cmp_hist, prov, cmp_url, cmp_key, cmp_model, cmp_sys, temp, num_ctx, cmp_ka,
+                    tx_cmp, cancel_cmp, ctx_cmp,
+                );
+            });
+        }
+    }
+
+    fn fork_at(&mut self, msg_idx: usize) {
+        if self.state.chats.is_empty() {
+            return;
+        }
+        let cur = &self.state.chats[self.active_chat_idx()];
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let id = format!("c_{}", ts);
+        let forked = Conversation {
+            id: id.clone(),
+            title: format!("Fork: {}", truncate(&cur.title, 32)),
+            pinned: false,
+            messages: cur.messages[..=msg_idx].to_vec(),
+        };
+        self.state.chats.insert(0, forked);
+        self.state.active_id = Some(id);
+        save_state(&self.state);
     }
 
     fn regenerate_at(&mut self, ctx: &egui::Context, msg_idx: usize) {
@@ -470,6 +532,8 @@ impl YokahuApp {
             model: self.state.model.clone(),
             images: Vec::new(),
             tool_name: String::new(),
+            compare_model: String::new(),
+            compare_content: String::new(),
         });
         self.busy = true;
         self.tok_count = 0;
@@ -562,6 +626,20 @@ impl eframe::App for YokahuApp {
                         }
                     }
                 }
+                WorkerEvent::CompareToken(chunk) => {
+                    if !self.state.chats.is_empty() {
+                        let idx = self.active_chat_idx();
+                        if let Some(last) = self.state.chats[idx].messages.last_mut() {
+                            last.compare_content.push_str(&chunk);
+                        }
+                    }
+                }
+                WorkerEvent::Transcript(text) => {
+                    if !self.prompt_input.is_empty() {
+                        self.prompt_input.push(' ');
+                    }
+                    self.prompt_input.push_str(&text);
+                }
                 WorkerEvent::ToolStart(desc) => {
                     if !self.state.chats.is_empty() {
                         let idx = self.active_chat_idx();
@@ -586,6 +664,8 @@ impl eframe::App for YokahuApp {
                                 model: String::new(),
                                 images: Vec::new(),
                                 tool_name: name,
+                                compare_model: String::new(),
+                                compare_content: String::new(),
                             },
                         );
                     }
@@ -740,14 +820,13 @@ impl eframe::App for YokahuApp {
                                             switch_to = Some(c.id.clone());
                                         }
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            if ui.small_button("x").on_hover_text("Delete").clicked() {
+                                            if icons::delete_button(ui).clicked() {
                                                 delete_id = Some(c.id.clone());
                                             }
-                                            if ui.small_button("e").on_hover_text("Rename").clicked() {
+                                            if icons::edit_button(ui).clicked() {
                                                 start_rename = Some((c.id.clone(), c.title.clone()));
                                             }
-                                            let pin_lbl = if c.pinned { "*" } else { "o" };
-                                            if ui.small_button(pin_lbl).on_hover_text("Pin/Unpin").clicked() {
+                                            if icons::pin_button(ui, c.pinned, th.c_accent()).clicked() {
                                                 toggle_pin = Some(c.id.clone());
                                             }
                                         });
@@ -811,6 +890,16 @@ impl eframe::App for YokahuApp {
                             });
                             let ws_label = self.state.workspace.as_deref().unwrap_or("No workspace selected");
                             ui.label(RichText::new(truncate(ws_label, 36)).size(11.0).color(th.c_muted()));
+                            if let Some(ws) = &self.state.workspace {
+                                if ui.small_button("Edit .yokahu.md").clicked() {
+                                    let mem = Path::new(ws).join(".yokahu.md");
+                                    if !mem.exists() {
+                                        let _ = fs::write(&mem, "# Project Memory\n\nAdd workspace conventions and context here.\n");
+                                    }
+                                    let body = safe_read_preview(&mem).unwrap_or_default();
+                                    self.preview_file = Some((".yokahu.md".to_string(), mem, body));
+                                }
+                            }
                             ui.add_space(6.0);
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 for entry in &self.workspace_tree {
@@ -835,7 +924,7 @@ impl eframe::App for YokahuApp {
                                                 self.preview_file = Some((entry.name.clone(), entry.path.clone(), body));
                                             }
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                if ui.small_button("+").on_hover_text("Attach to chat").clicked() {
+                                                if icons::plus_button(ui, "Attach to chat").clicked() {
                                                     if let Some(att) = read_attachment(&ctx, &entry.path) {
                                                         self.attachments.push(att);
                                                     } else {
@@ -948,6 +1037,25 @@ impl eframe::App for YokahuApp {
                                 ui.separator();
 
                                 ui.label(RichText::new("Integrations & UI").size(12.0).strong().color(th.c_text()));
+                                if ui.checkbox(&mut self.state.compare_enabled, "Compare 2 models side-by-side").changed() {
+                                    save_state(&self.state);
+                                }
+                                if self.state.compare_enabled {
+                                    if ui
+                                        .add(egui::TextEdit::singleline(&mut self.state.compare_model).hint_text("2nd model").desired_width(ui.available_width()))
+                                        .changed()
+                                    {
+                                        save_state(&self.state);
+                                    }
+                                }
+                                ui.label(RichText::new("Whisper CLI (optional STT):").size(11.0).color(th.c_muted()));
+                                if ui
+                                    .add(egui::TextEdit::singleline(&mut self.state.whisper_cli).desired_width(ui.available_width()))
+                                    .changed()
+                                {
+                                    save_state(&self.state);
+                                }
+                                ui.add_space(4.0);
                                 if ui.add_sized([ui.available_width(), 28.0], egui::Button::new(format!("MCP Servers ({} tools)...", self.mcp_tools.len()))).clicked() {
                                     self.show_mcp_modal = true;
                                 }
@@ -998,7 +1106,7 @@ impl eframe::App for YokahuApp {
                             (AMBER, format!("{} Offline", self.state.provider.label()))
                         };
                         ui.label(RichText::new(status_txt).size(12.0).color(th.c_muted()));
-                        ui.label(RichText::new("\u{25CF}").size(12.0).color(dot_col));
+                        icons::status_dot(ui, dot_col);
                         if ui.small_button("Export .md").clicked() {
                             self.export_active_chat(false);
                         }
@@ -1101,13 +1209,25 @@ impl eframe::App for YokahuApp {
 
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Attach File...").clicked() {
+                            if ui.button("Attach...").clicked() {
                                 if let Some(files) = rfd::FileDialog::new().pick_files() {
                                     for p in files {
                                         if let Some(att) = read_attachment(&ctx, &p) {
                                             self.attachments.push(att);
                                         }
                                     }
+                                }
+                            }
+                            if ui.button("Voice...").on_hover_text("Transcribe audio via local Whisper CLI").clicked() {
+                                if let Some(audio) = rfd::FileDialog::new()
+                                    .add_filter("Audio", &["wav", "mp3", "m4a", "ogg", "flac"])
+                                    .pick_file()
+                                {
+                                    let cli = self.state.whisper_cli.clone();
+                                    let tx = self.tx.clone();
+                                    let ctx_c = ctx.clone();
+                                    self.status_note = "Transcribing audio...".to_string();
+                                    thread::spawn(move || transcribe_audio(&cli, &audio, &tx, &ctx_c));
                                 }
                             }
                             let est_chars: usize = self
@@ -1182,6 +1302,8 @@ impl eframe::App for YokahuApp {
                                 let msgs_snapshot = chat.messages.clone();
                                 let mut edit_user_idx: Option<usize> = None;
                                 let mut regen_idx: Option<usize> = None;
+                                let mut fork_idx: Option<usize> = None;
+                                let mut apply_code_req: Option<String> = None;
 
                                 for (m_idx, msg) in msgs_snapshot.iter().enumerate() {
                                     if msg.role == "user" {
@@ -1222,9 +1344,15 @@ impl eframe::App for YokahuApp {
                                         let model_lbl = if msg.model.is_empty() { &self.state.model } else { &msg.model };
                                         ui.horizontal(|ui| {
                                             ui.label(RichText::new(model_lbl).size(11.0).color(th.c_muted()));
+                                            if icons::speaker_button(ui).clicked() {
+                                                speak_text(&msg.content);
+                                            }
                                             if !self.busy {
                                                 if ui.small_button("Copy").clicked() {
                                                     ctx.copy_text(msg.content.clone());
+                                                }
+                                                if ui.small_button("Fork").clicked() {
+                                                    fork_idx = Some(m_idx);
                                                 }
                                                 if ui.small_button("Regenerate").clicked() {
                                                     regen_idx = Some(m_idx);
@@ -1244,7 +1372,20 @@ impl eframe::App for YokahuApp {
                                                 );
                                             });
                                         }
-                                        markdown::render_markdown(ui, &ctx, &th, &msg.content);
+                                        if !msg.compare_model.is_empty() {
+                                            ui.columns(2, |cols| {
+                                                cols[0].label(RichText::new(model_lbl).size(11.5).strong().color(th.c_accent()));
+                                                if let Some(code) = markdown::render_markdown(&mut cols[0], &ctx, &th, &msg.content) {
+                                                    apply_code_req = Some(code);
+                                                }
+                                                cols[1].label(RichText::new(&msg.compare_model).size(11.5).strong().color(GREEN));
+                                                if let Some(code) = markdown::render_markdown(&mut cols[1], &ctx, &th, &msg.compare_content) {
+                                                    apply_code_req = Some(code);
+                                                }
+                                            });
+                                        } else if let Some(code) = markdown::render_markdown(ui, &ctx, &th, &msg.content) {
+                                            apply_code_req = Some(code);
+                                        }
                                     }
                                     ui.add_space(12.0);
                                 }
@@ -1257,6 +1398,21 @@ impl eframe::App for YokahuApp {
                                 }
                                 if let Some(r_idx) = regen_idx {
                                     self.regenerate_at(&ctx, r_idx);
+                                }
+                                if let Some(f_idx) = fork_idx {
+                                    self.fork_at(f_idx);
+                                }
+                                if let Some(code) = apply_code_req {
+                                    let mut dlg = rfd::FileDialog::new();
+                                    if let Some(ws) = &self.state.workspace {
+                                        dlg = dlg.set_directory(ws);
+                                    }
+                                    if let Some(path) = dlg.save_file() {
+                                        match fs::write(&path, &code) {
+                                            Ok(_) => self.status_note = format!("Applied to {}", path.display()),
+                                            Err(e) => self.status_note = format!("Apply failed: {}", e),
+                                        }
+                                    }
                                 }
                             }
 
@@ -1455,4 +1611,58 @@ fn sanitize_filename(s: &str) -> String {
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
     if clean.is_empty() { "yokahu_chat".to_string() } else { clean }
+}
+
+fn speak_text(text: &str) {
+    let clean: String = text.chars().take(1500).collect();
+    thread::spawn(move || {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let escaped = clean.replace('\'', "''");
+            let script = format!(
+                "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Speak('{}')",
+                escaped
+            );
+            let mut cmd = std::process::Command::new("powershell");
+            cmd.args(["-NoProfile", "-Command", &script]);
+            cmd.creation_flags(0x08000000);
+            let _ = cmd.output();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("say").arg(&clean).output();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("spd-say").arg(&clean).output();
+        }
+    });
+}
+
+fn transcribe_audio(cli: &str, audio: &Path, tx: &Sender<WorkerEvent>, ctx: &egui::Context) {
+    let out_dir = std::env::temp_dir().join("yokahu_whisper");
+    let _ = fs::create_dir_all(&out_dir);
+    let res = std::process::Command::new(cli.trim())
+        .arg(audio)
+        .args(["--output_format", "txt", "--output_dir"])
+        .arg(&out_dir)
+        .output();
+    match res {
+        Ok(o) if o.status.success() => {
+            let stem = audio.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
+            let txt_path = out_dir.join(format!("{}.txt", stem));
+            let text = fs::read_to_string(&txt_path)
+                .unwrap_or_else(|_| String::from_utf8_lossy(&o.stdout).to_string());
+            let _ = tx.send(WorkerEvent::Transcript(text.trim().to_string()));
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let _ = tx.send(WorkerEvent::Error(format!("Whisper failed: {}", err.trim())));
+        }
+        Err(e) => {
+            let _ = tx.send(WorkerEvent::Error(format!("Cannot run '{}': {}", cli, e)));
+        }
+    }
+    ctx.request_repaint();
 }

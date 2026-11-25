@@ -1,6 +1,6 @@
 [package]
 name = "yokahu"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 
@@ -14,7 +14,7 @@ path = "src/bin/yokahu-ui.rs"
 
 [dependencies]
 arboard = "3.7.0"
-eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "system_fonts", "x11", "wayland"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
