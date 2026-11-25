@@ -140,6 +140,8 @@ pub struct PersistedState {
     pub compare_model: String,
     #[serde(default)]
     pub whisper_cli: String,
+    #[serde(default)]
+    pub web_tools_enabled: bool,
 }
 
 impl Default for PersistedState {
@@ -164,6 +166,7 @@ impl Default for PersistedState {
             compare_enabled: false,
             compare_model: "qwen2.5-coder:7b-instruct-q6_K".to_string(),
             whisper_cli: "whisper".to_string(),
+            web_tools_enabled: false,
         }
     }
 }
@@ -469,6 +472,7 @@ impl YokahuApp {
         let keep_alive = self.state.keep_alive.clone();
         let workspace = self.state.workspace.clone().map(PathBuf::from);
         let safety = self.state.safety_mode;
+        let web_tools = self.state.web_tools_enabled;
         let mcp_cfg = self.mcp_cfg.clone();
         let mcp_tools = self.mcp_tools.clone();
         let mcp_pool = self.mcp_pool.clone();
@@ -490,7 +494,7 @@ impl YokahuApp {
         thread::spawn(move || {
             agent::run_agent_loop(
                 history, prov, base_url, api_key, model, system, think, temp, num_ctx, keep_alive,
-                workspace, safety, mcp_cfg, mcp_tools, mcp_pool, tx, cancel, ctx_clone,
+                workspace, safety, web_tools, mcp_cfg, mcp_tools, mcp_pool, tx, cancel, ctx_clone,
             );
         });
         if cmp_enabled {
@@ -741,7 +745,9 @@ impl eframe::App for YokahuApp {
         // Sidebar
         if self.show_sidebar {
             egui::Panel::left("sidebar")
-                .exact_size(290.0)
+                .resizable(true)
+                .default_size(295.0)
+                .size_range(220.0..=480.0)
                 .frame(egui::Frame::NONE.fill(th.c_sidebar()).inner_margin(14.0))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -1039,16 +1045,25 @@ impl eframe::App for YokahuApp {
                                 ui.separator();
 
                                 ui.label(RichText::new("Integrations & UI").size(12.0).strong().color(th.c_text()));
+                                if ui.checkbox(&mut self.state.web_tools_enabled, "Web Search / Fetch URL (online)").changed() {
+                                    save_state(&self.state);
+                                }
                                 if ui.checkbox(&mut self.state.compare_enabled, "Compare 2 models side-by-side").changed() {
                                     save_state(&self.state);
                                 }
                                 if self.state.compare_enabled {
-                                    if ui
-                                        .add(egui::TextEdit::singleline(&mut self.state.compare_model).hint_text("2nd model").desired_width(ui.available_width()))
-                                        .changed()
-                                    {
-                                        save_state(&self.state);
-                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("2nd Model:").size(11.5).color(th.c_muted()));
+                                        egui::ComboBox::from_id_salt("compare_model_pick")
+                                            .selected_text(truncate(&self.state.compare_model, 22))
+                                            .show_ui(ui, |ui| {
+                                                for m in &self.models {
+                                                    if ui.selectable_value(&mut self.state.compare_model, m.clone(), m).changed() {
+                                                        save_state(&self.state);
+                                                    }
+                                                }
+                                            });
+                                    });
                                 }
                                 ui.label(RichText::new("Whisper CLI (optional STT):").size(11.0).color(th.c_muted()));
                                 if ui

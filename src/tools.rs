@@ -109,6 +109,116 @@ pub fn is_mutating_tool(name: &str) -> bool {
     matches!(name, "write_file" | "run_command")
 }
 
+pub fn is_web_tool(name: &str) -> bool {
+    matches!(name, "web_search" | "fetch_url")
+}
+
+pub fn web_tools_schema() -> Value {
+    json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web via DuckDuckGo (requires internet).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search query." }
+                    },
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "description": "Fetch a web page and extract readable text (up to 16 KB).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "HTTP or HTTPS URL." }
+                    },
+                    "required": ["url"]
+                }
+            }
+        }
+    ])
+}
+
+pub fn execute_web_tool(name: &str, args: &Value) -> String {
+    match name {
+        "web_search" => {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if query.is_empty() {
+                return "Error: empty query".to_string();
+            }
+            let encoded: String = query
+                .bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => (b as char).to_string(),
+                    b' ' => "+".to_string(),
+                    _ => format!("%{:02X}", b),
+                })
+                .collect();
+            let url = format!("https://html.duckduckgo.com/html/?q={}", encoded);
+            match ureq::get(&url).header("User-Agent", "Mozilla/5.0").call() {
+                Ok(mut resp) => {
+                    let html = resp.body_mut().read_to_string().unwrap_or_default();
+                    let text = strip_html_tags(&html);
+                    text.chars().take(8000).collect()
+                }
+                Err(e) => format!("Web search error: {}", e),
+            }
+        }
+        "fetch_url" => {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return "Error: URL must start with http:// or https://".to_string();
+            }
+            match ureq::get(url).header("User-Agent", "Yokahu/0.6").call() {
+                Ok(mut resp) => {
+                    let raw = resp.body_mut().read_to_string().unwrap_or_default();
+                    let text = strip_html_tags(&raw);
+                    text.chars().take(16000).collect()
+                }
+                Err(e) => format!("Fetch error: {}", e),
+            }
+        }
+        other => format!("Unknown web tool: {}", other),
+    }
+}
+
+pub fn strip_html_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() / 3);
+    let mut in_tag = false;
+    let mut last_space = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                if !last_space {
+                    out.push(' ');
+                    last_space = true;
+                }
+            }
+            _ if in_tag => {}
+            c if c.is_whitespace() => {
+                if !last_space {
+                    out.push(' ');
+                    last_space = true;
+                }
+            }
+            c => {
+                out.push(c);
+                last_space = false;
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
 fn resolve_path(workspace: Option<&Path>, raw: &str) -> PathBuf {
     let p = PathBuf::from(raw);
     if p.is_absolute() {
@@ -279,6 +389,11 @@ mod tests {
         assert!(diff.iter().any(|(k, l)| *k == '-' && l == "old"));
         assert!(diff.iter().any(|(k, l)| *k == '+' && l == "new"));
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn strip_html_removes_tags() {
+        assert_eq!(strip_html_tags("<h1>Hello</h1> <p>World</p>"), "Hello World");
     }
 }
 

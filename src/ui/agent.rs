@@ -110,6 +110,7 @@ pub fn run_agent_loop(
     keep_alive: String,
     workspace: Option<PathBuf>,
     safety: SafetyMode,
+    web_tools_enabled: bool,
     mcp_cfg: McpConfigFile,
     mcp_tools: Vec<DiscoveredMcpTool>,
     mcp_pool: Arc<McpPool>,
@@ -154,51 +155,76 @@ pub fn run_agent_loop(
             all_tools.extend(arr.iter().cloned());
         }
     }
+    if web_tools_enabled {
+        if let Some(arr) = tools::web_tools_schema().as_array() {
+            all_tools.extend(arr.iter().cloned());
+        }
+    }
     all_tools.extend(mcp_client::to_tool_schemas(&mcp_tools));
 
     let http_client = agent();
+    let mut use_tools = !all_tools.is_empty();
 
     for _step in 0..8 {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
 
-        let (subpath, payload) = match prov {
-            ProviderKind::Ollama => {
-                let mut body = json!({
-                    "model": model,
-                    "messages": api_msgs,
-                    "stream": true,
-                    "think": think,
-                    "keep_alive": keep_alive,
-                    "options": { "temperature": temp, "num_ctx": num_ctx }
-                });
-                if !all_tools.is_empty() {
-                    body["tools"] = Value::Array(all_tools.clone());
+        let build_payload = |with_tools: bool| -> (&'static str, String) {
+            match prov {
+                ProviderKind::Ollama => {
+                    let mut body = json!({
+                        "model": model,
+                        "messages": api_msgs,
+                        "stream": true,
+                        "think": think,
+                        "keep_alive": keep_alive,
+                        "options": { "temperature": temp, "num_ctx": num_ctx }
+                    });
+                    if with_tools && !all_tools.is_empty() {
+                        body["tools"] = Value::Array(all_tools.clone());
+                    }
+                    ("/api/chat", body.to_string())
                 }
-                ("/api/chat", body.to_string())
-            }
-            ProviderKind::OpenAiCompat => {
-                let mut body = json!({
-                    "model": model,
-                    "messages": api_msgs,
-                    "stream": true,
-                    "temperature": temp
-                });
-                if !all_tools.is_empty() {
-                    body["tools"] = Value::Array(all_tools.clone());
+                ProviderKind::OpenAiCompat => {
+                    let mut body = json!({
+                        "model": model,
+                        "messages": api_msgs,
+                        "stream": true,
+                        "temperature": temp
+                    });
+                    if with_tools && !all_tools.is_empty() {
+                        body["tools"] = Value::Array(all_tools.clone());
+                    }
+                    ("/chat/completions", body.to_string())
                 }
-                ("/chat/completions", body.to_string())
             }
         };
 
+        let (subpath, payload) = build_payload(use_tools);
         let url = build_url(&base_url, subpath);
-        let mut req = http_client.post(&url).header("Content-Type", "application/json");
-        if !api_key.trim().is_empty() {
-            req = req.header("Authorization", &format!("Bearer {}", api_key.trim()));
-        }
-        let resp = match req.send(payload.as_str()) {
+        let send_req = |u: &str, p: &str| {
+            let mut req = http_client.post(u).header("Content-Type", "application/json");
+            if !api_key.trim().is_empty() {
+                req = req.header("Authorization", &format!("Bearer {}", api_key.trim()));
+            }
+            req.send(p)
+        };
+
+        let resp = match send_req(&url, &payload) {
             Ok(r) => r,
+            Err(ureq::Error::StatusCode(400)) if use_tools => {
+                // Fallback for models that do not support tool calling
+                use_tools = false;
+                let (_, fallback_payload) = build_payload(false);
+                match send_req(&url, &fallback_payload) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(WorkerEvent::Error(format!("Request failed ({}): {}", url, e)));
+                        break;
+                    }
+                }
+            }
             Err(e) => {
                 let _ = tx.send(WorkerEvent::Error(format!("Request failed ({}): {}", url, e)));
                 break;
@@ -357,6 +383,8 @@ pub fn run_agent_loop(
                 mcp_pool
                     .call_tool(&mcp_cfg, name, &args)
                     .unwrap_or_else(|e| format!("MCP error: {}", e))
+            } else if tools::is_web_tool(name) {
+                tools::execute_web_tool(name, &args)
             } else {
                 tools::execute_tool(workspace.as_deref(), name, &args)
             };
