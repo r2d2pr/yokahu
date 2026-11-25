@@ -2,20 +2,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct McpServerConfig {
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub url: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -39,11 +44,33 @@ pub struct DiscoveredMcpTool {
     pub input_schema: Value,
 }
 
+pub fn app_data_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
+        return base.join("Yokahu");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+        return home.join("Library").join("Application Support").join("Yokahu");
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            if !xdg.is_empty() {
+                return PathBuf::from(xdg).join("yokahu");
+            }
+        }
+        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+        home.join(".local").join("share").join("yokahu")
+    }
+}
+
 pub fn config_path() -> PathBuf {
-    let base = std::env::var("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    base.join("Yokahu").join("mcp_config.json")
+    app_data_dir().join("mcp_config.json")
 }
 
 pub fn load_config() -> McpConfigFile {
@@ -109,6 +136,68 @@ fn spawn_and_exchange(cfg: &McpServerConfig, requests: &[Value]) -> Result<Vec<V
     Ok(responses)
 }
 
+fn http_post_json(url: &str, body: &Value) -> Result<Value, String> {
+    let trimmed = url.trim().trim_end_matches('/');
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .ok_or_else(|| "Streamable HTTP currently supports http:// local/LAN URLs".to_string())?;
+    let (host_port, path) = match without_scheme.split_once('/') {
+        Some((hp, p)) => (hp, format!("/{}", p)),
+        None => (without_scheme, "/".to_string()),
+    };
+    let (host, port) = if let Some((h, p)) = host_port.rsplit_once(':') {
+        (h.to_string(), p.parse::<u16>().unwrap_or(80))
+    } else {
+        (host_port.to_string(), 80)
+    };
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .map_err(|e| format!("Invalid MCP URL {}: {}", url, e))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| format!("MCP HTTP connect failed: {}", e))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+
+    let payload = body.to_string();
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path,
+        host,
+        port,
+        payload.len(),
+        payload
+    );
+    stream.write_all(req.as_bytes()).map_err(|e| format!("Write error: {}", e))?;
+
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).map_err(|e| format!("Read error: {}", e))?;
+    let body_part = raw.split("\r\n\r\n").nth(1).unwrap_or(&raw);
+    for line in body_part.lines() {
+        let t = line.trim();
+        let clean = t.strip_prefix("data:").map(|s| s.trim()).unwrap_or(t);
+        if clean.starts_with('{') {
+            if let Ok(v) = serde_json::from_str::<Value>(clean) {
+                return Ok(v);
+            }
+        }
+    }
+    Err(format!("No JSON-RPC response from {}", url))
+}
+
+fn exchange_mcp(cfg: &McpServerConfig, requests: &[Value]) -> Result<Vec<Value>, String> {
+    if !cfg.url.trim().is_empty() {
+        let mut resps = Vec::new();
+        for req in requests {
+            if req.get("id").is_none() {
+                continue;
+            }
+            resps.push(http_post_json(&cfg.url, req)?);
+        }
+        Ok(resps)
+    } else {
+        spawn_and_exchange(cfg, requests)
+    }
+}
+
 pub fn discover_tools(cfg: &McpConfigFile) -> (Vec<DiscoveredMcpTool>, Vec<String>) {
     let mut tools = Vec::new();
     let mut errors = Vec::new();
@@ -132,7 +221,7 @@ pub fn discover_tools(cfg: &McpConfigFile) -> (Vec<DiscoveredMcpTool>, Vec<Strin
             json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
         ];
 
-        match spawn_and_exchange(scfg, &reqs) {
+        match exchange_mcp(scfg, &reqs) {
             Ok(resps) => {
                 if let Some(list_resp) = resps.into_iter().find(|r| r.get("id") == Some(&json!(2))) {
                     if let Some(arr) = list_resp
@@ -223,7 +312,7 @@ pub fn call_mcp_tool(cfg: &McpConfigFile, full_name: &str, args: &Value) -> Resu
         }),
     ];
 
-    let resps = spawn_and_exchange(scfg, &reqs)?;
+    let resps = exchange_mcp(scfg, &reqs)?;
     let call_resp = resps
         .into_iter()
         .find(|r| r.get("id") == Some(&json!(2)))
@@ -246,4 +335,66 @@ pub fn call_mcp_tool(cfg: &McpConfigFile, full_name: &str, args: &Value) -> Resu
         .unwrap_or_else(|| call_resp.to_string());
 
     Ok(content)
+}
+
+pub fn scaffold_mcp_server(lang: &str, name: &str, dir: &Path) -> Result<McpServerConfig, String> {
+    let target_dir = dir.join(name);
+    fs::create_dir_all(&target_dir).map_err(|e| format!("Cannot create dir: {}", e))?;
+
+    if lang == "python" {
+        let script_path = target_dir.join("server.py");
+        let code = format!(
+            "\"\"\"Custom MCP server '{}' for Yokahu.\"\"\"\nimport json\nimport sys\n\nTOOLS = [{{\n    \"name\": \"hello\",\n    \"description\": \"Example tool from {} MCP server.\",\n    \"inputSchema\": {{\"type\": \"object\", \"properties\": {{\"name\": {{\"type\": \"string\"}}}}, \"required\": [\"name\"]}}\n}}]\n\ndef handle_tool(tool_name, args):\n    if tool_name == \"hello\":\n        return {{\"content\": [{{\"type\": \"text\", \"text\": f\"Hello {{args.get('name', 'world')}} from {}!\"}}]}}\n    return {{\"content\": [{{\"type\": \"text\", \"text\": f\"Unknown tool: {{tool_name}}\"}}], \"isError\": True}}\n\nfor line in sys.stdin:\n    line = line.strip()\n    if not line:\n        continue\n    req = json.loads(line)\n    method = req.get(\"method\", \"\")\n    if method == \"notifications/initialized\" or \"id\" not in req:\n        continue\n    req_id = req[\"id\"]\n    params = req.get(\"params\") or {{}}\n    if method == \"initialize\":\n        res = {{\"protocolVersion\": params.get(\"protocolVersion\", \"2024-11-05\"), \"capabilities\": {{\"tools\": {{}}}}, \"serverInfo\": {{\"name\": \"{}\", \"version\": \"0.1.0\"}}}}\n    elif method == \"ping\":\n        res = {{}}\n    elif method == \"tools/list\":\n        res = {{\"tools\": TOOLS}}\n    elif method == \"tools/call\":\n        res = handle_tool(params.get(\"name\", \"\"), params.get(\"arguments\") or {{}})\n    else:\n        sys.stdout.write(json.dumps({{\"jsonrpc\": \"2.0\", \"id\": req_id, \"error\": {{\"code\": -32601, \"message\": \"Method not found\"}}}}) + \"\\n\")\n        sys.stdout.flush()\n        continue\n    sys.stdout.write(json.dumps({{\"jsonrpc\": \"2.0\", \"id\": req_id, \"result\": res}}) + \"\\n\")\n    sys.stdout.flush()\n",
+            name, name, name, name
+        );
+        fs::write(&script_path, code).map_err(|e| format!("Write failed: {}", e))?;
+        Ok(McpServerConfig {
+            command: "python".to_string(),
+            args: vec![script_path.display().to_string()],
+            env: BTreeMap::new(),
+            url: String::new(),
+            enabled: true,
+        })
+    } else {
+        let src_dir = target_dir.join("src");
+        fs::create_dir_all(&src_dir).map_err(|e| format!("Cannot create src dir: {}", e))?;
+        let cargo_toml = format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            name
+        );
+        fs::write(target_dir.join("Cargo.toml"), cargo_toml).map_err(|e| format!("Write failed: {}", e))?;
+        let main_rs = r##"use std::io::{self, BufRead, Write};
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for line in stdin.lock().lines().flatten() {
+        let t = line.trim();
+        if t.is_empty() || t.contains("\"notifications/initialized\"") { continue; }
+        if t.contains("\"initialize\"") {
+            let _ = writeln!(out, r#"{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"custom-rust-mcp","version":"0.1.0"}}}}}}"#);
+        } else if t.contains("\"tools/list\"") {
+            let _ = writeln!(out, r#"{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"hello","description":"Example Rust MCP tool","inputSchema":{{"type":"object","properties":{{"name":{{"type":"string"}}}},"required":["name"]}}}}]}}}}"#);
+        } else if t.contains("\"tools/call\"") {
+            let _ = writeln!(out, r#"{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"Hello from custom Rust MCP server!"}}]}}}}"#);
+        }
+        let _ = out.flush();
+    }
+}
+"##;
+        fs::write(src_dir.join("main.rs"), main_rs).map_err(|e| format!("Write failed: {}", e))?;
+        Ok(McpServerConfig {
+            command: "cargo".to_string(),
+            args: vec![
+                "run".to_string(),
+                "--quiet".to_string(),
+                "--manifest-path".to_string(),
+                target_dir.join("Cargo.toml").display().to_string(),
+            ],
+            env: BTreeMap::new(),
+            url: String::new(),
+            enabled: true,
+        })
+    }
 }

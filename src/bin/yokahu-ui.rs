@@ -1,9 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, RichText, Stroke};
-use qwen_local::mcp_client::{self, DiscoveredMcpTool, McpConfigFile, McpServerConfig};
-use qwen_local::ollama;
-use qwen_local::tools::{self, SafetyMode};
+use yokahu::mcp_client::{self, DiscoveredMcpTool, McpConfigFile, McpServerConfig};
+use yokahu::ollama;
+use yokahu::tools::{self, SafetyMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -31,6 +31,7 @@ const RED: Color32 = Color32::from_rgb(248, 81, 73);
 const AMBER: Color32 = Color32::from_rgb(210, 153, 34);
 
 const ICON_PNG: &[u8] = include_bytes!("../../assets/icon.png");
+const LOGO_JPG: &[u8] = include_bytes!("../../assets/logo.jpg");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum ProviderKind {
@@ -162,6 +163,14 @@ struct YokahuApp {
     new_mcp_name: String,
     new_mcp_cmd: String,
     new_mcp_args: String,
+    new_mcp_env: String,
+    new_mcp_url: String,
+    new_mcp_is_http: bool,
+    scaffold_name: String,
+    scaffold_lang: String,
+    mcp_status_msg: String,
+    show_onboarding: bool,
+    logo_tex: Option<egui::TextureHandle>,
     status_note: String,
 }
 
@@ -188,6 +197,13 @@ impl YokahuApp {
             ctx_boot.request_repaint();
         });
 
+        let logo_tex = image::load_from_memory(LOGO_JPG).ok().map(|img| {
+            let rgba = img.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let color_img = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+            cc.egui_ctx.load_texture("yokahu_logo", color_img, egui::TextureOptions::LINEAR)
+        });
+
         let mut app = Self {
             sys_draft: state.system_prompt.clone(),
             state,
@@ -212,6 +228,14 @@ impl YokahuApp {
             new_mcp_name: String::new(),
             new_mcp_cmd: String::new(),
             new_mcp_args: String::new(),
+            new_mcp_env: String::new(),
+            new_mcp_url: String::new(),
+            new_mcp_is_http: false,
+            scaffold_name: "my-mcp".to_string(),
+            scaffold_lang: "python".to_string(),
+            mcp_status_msg: String::new(),
+            show_onboarding: false,
+            logo_tex,
             status_note: String::new(),
         };
         if app.state.chats.is_empty() {
@@ -385,6 +409,9 @@ impl eframe::App for YokahuApp {
             match ev {
                 WorkerEvent::Models(list, ok) => {
                     self.endpoint_ok = ok;
+                    if !ok || list.is_empty() {
+                        self.show_onboarding = true;
+                    }
                     if !list.is_empty() {
                         self.models = list;
                         if self.state.model.trim().is_empty() {
@@ -763,8 +790,12 @@ impl eframe::App for YokahuApp {
                     .show(ui, |ui| {
                         let chat = &self.state.chats[self.active_chat_idx()];
                         if chat.messages.is_empty() {
-                            ui.add_space(80.0);
+                            ui.add_space(40.0);
                             ui.vertical_centered(|ui| {
+                                if let Some(tex) = &self.logo_tex {
+                                    ui.image((tex.id(), egui::vec2(150.0, 150.0)));
+                                    ui.add_space(8.0);
+                                }
                                 ui.label(RichText::new("Yokahu Local AI Workspace").size(22.0).strong().color(TEXT));
                                 ui.add_space(6.0);
                                 ui.label(
@@ -994,7 +1025,7 @@ impl eframe::App for YokahuApp {
             egui::Window::new("MCP Servers (Custom Tools)")
                 .collapsible(false)
                 .resizable(true)
-                .default_width(540.0)
+                .default_width(600.0)
                 .show(&ctx, |ui| {
                     ui.label(
                         RichText::new(format!("Config: {}", mcp_client::config_path().display()))
@@ -1010,11 +1041,14 @@ impl eframe::App for YokahuApp {
                             if ui.checkbox(&mut scfg.enabled, name).changed() {
                                 changed = true;
                             }
-                            ui.label(
-                                RichText::new(format!("{} {}", scfg.command, scfg.args.join(" ")))
-                                    .size(11.5)
-                                    .color(TEXT_MUTED),
-                            );
+                            let summary = if !scfg.url.is_empty() {
+                                format!("HTTP: {}", scfg.url)
+                            } else if scfg.env.is_empty() {
+                                format!("{} {}", scfg.command, scfg.args.join(" "))
+                            } else {
+                                format!("{} {} [env: {}]", scfg.command, scfg.args.join(" "), scfg.env.len())
+                            };
+                            ui.label(RichText::new(summary).size(11.5).color(TEXT_MUTED));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.small_button("Remove").clicked() {
                                     remove_name = Some(name.clone());
@@ -1032,36 +1066,101 @@ impl eframe::App for YokahuApp {
                     }
 
                     ui.separator();
-                    ui.label("Add Stdio MCP Server:");
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.new_mcp_name).hint_text("name").desired_width(90.0));
-                        ui.add(egui::TextEdit::singleline(&mut self.new_mcp_cmd).hint_text("command (e.g. python, npx, exe)").desired_width(180.0));
-                        ui.add(egui::TextEdit::singleline(&mut self.new_mcp_args).hint_text("args (space-separated)").desired_width(170.0));
-                        if ui.button("Add").clicked()
-                            && !self.new_mcp_name.trim().is_empty()
-                            && !self.new_mcp_cmd.trim().is_empty()
-                        {
-                            let args: Vec<String> = self
-                                .new_mcp_args
-                                .split_whitespace()
-                                .map(|s| s.to_string())
-                                .collect();
-                            self.mcp_cfg.mcp_servers.insert(
-                                self.new_mcp_name.trim().to_string(),
-                                McpServerConfig {
-                                    command: self.new_mcp_cmd.trim().to_string(),
-                                    args,
-                                    env: BTreeMap::new(),
-                                    enabled: true,
-                                },
-                            );
-                            self.new_mcp_name.clear();
-                            self.new_mcp_cmd.clear();
-                            self.new_mcp_args.clear();
-                            mcp_client::save_config(&self.mcp_cfg);
-                            self.refresh_mcp(&ctx);
+                        ui.label("Add MCP Server:");
+                        ui.selectable_value(&mut self.new_mcp_is_http, false, "Stdio");
+                        ui.selectable_value(&mut self.new_mcp_is_http, true, "Streamable HTTP");
+                    });
+
+                    if self.new_mcp_is_http {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.new_mcp_name).hint_text("name").desired_width(100.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.new_mcp_url).hint_text("http://127.0.0.1:8000/mcp").desired_width(340.0));
+                            if ui.button("Add").clicked()
+                                && !self.new_mcp_name.trim().is_empty()
+                                && !self.new_mcp_url.trim().is_empty()
+                            {
+                                self.mcp_cfg.mcp_servers.insert(
+                                    self.new_mcp_name.trim().to_string(),
+                                    McpServerConfig {
+                                        command: String::new(),
+                                        args: Vec::new(),
+                                        env: BTreeMap::new(),
+                                        url: self.new_mcp_url.trim().to_string(),
+                                        enabled: true,
+                                    },
+                                );
+                                self.new_mcp_name.clear();
+                                self.new_mcp_url.clear();
+                                mcp_client::save_config(&self.mcp_cfg);
+                                self.refresh_mcp(&ctx);
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.new_mcp_name).hint_text("name").desired_width(90.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.new_mcp_cmd).hint_text("command (python, exe, npx)").desired_width(170.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.new_mcp_args).hint_text("args (space-separated)").desired_width(180.0));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.new_mcp_env).hint_text("ENV (optional: KEY=VAL,KEY2=VAL2)").desired_width(380.0));
+                            if ui.button("Add Stdio").clicked()
+                                && !self.new_mcp_name.trim().is_empty()
+                                && !self.new_mcp_cmd.trim().is_empty()
+                            {
+                                let args: Vec<String> = self.new_mcp_args.split_whitespace().map(|s| s.to_string()).collect();
+                                let mut env = BTreeMap::new();
+                                for pair in self.new_mcp_env.split(',') {
+                                    if let Some((k, v)) = pair.split_once('=') {
+                                        if !k.trim().is_empty() {
+                                            env.insert(k.trim().to_string(), v.trim().to_string());
+                                        }
+                                    }
+                                }
+                                self.mcp_cfg.mcp_servers.insert(
+                                    self.new_mcp_name.trim().to_string(),
+                                    McpServerConfig {
+                                        command: self.new_mcp_cmd.trim().to_string(),
+                                        args,
+                                        env,
+                                        url: String::new(),
+                                        enabled: true,
+                                    },
+                                );
+                                self.new_mcp_name.clear();
+                                self.new_mcp_cmd.clear();
+                                self.new_mcp_args.clear();
+                                self.new_mcp_env.clear();
+                                mcp_client::save_config(&self.mcp_cfg);
+                                self.refresh_mcp(&ctx);
+                            }
+                        });
+                    }
+
+                    ui.separator();
+                    ui.label("Create New MCP Server (Scaffold + Auto-Register):");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.scaffold_name).hint_text("server-name").desired_width(140.0));
+                        ui.selectable_value(&mut self.scaffold_lang, "python".to_string(), "Python");
+                        ui.selectable_value(&mut self.scaffold_lang, "rust".to_string(), "Rust");
+                        if ui.button("Pick Folder & Generate...").clicked() && !self.scaffold_name.trim().is_empty() {
+                            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                let name = self.scaffold_name.trim().to_string();
+                                match mcp_client::scaffold_mcp_server(&self.scaffold_lang, &name, &dir) {
+                                    Ok(cfg) => {
+                                        self.mcp_cfg.mcp_servers.insert(name.clone(), cfg);
+                                        mcp_client::save_config(&self.mcp_cfg);
+                                        self.mcp_status_msg = format!("Created & registered '{}' in {}", name, dir.display());
+                                        self.refresh_mcp(&ctx);
+                                    }
+                                    Err(e) => self.mcp_status_msg = format!("Scaffold error: {}", e),
+                                }
+                            }
                         }
                     });
+                    if !self.mcp_status_msg.is_empty() {
+                        ui.label(RichText::new(&self.mcp_status_msg).size(11.5).color(GREEN));
+                    }
 
                     if !self.mcp_errors.is_empty() {
                         ui.add_space(4.0);
@@ -1073,7 +1172,7 @@ impl eframe::App for YokahuApp {
                     if !self.mcp_tools.is_empty() {
                         ui.separator();
                         ui.label(RichText::new(format!("Discovered Tools ({}):", self.mcp_tools.len())).size(12.0));
-                        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
                             for t in &self.mcp_tools {
                                 ui.label(
                                     RichText::new(format!("• {} — {}", t.full_name, t.description))
@@ -1091,6 +1190,34 @@ impl eframe::App for YokahuApp {
                         }
                         if ui.button("Close").clicked() {
                             self.show_mcp_modal = false;
+                        }
+                    });
+                });
+        }
+
+        // First-Run Onboarding Modal
+        if self.show_onboarding {
+            egui::Window::new("Welcome to Yokahu — Model Setup")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(440.0)
+                .show(&ctx, |ui| {
+                    ui.label("No active local model endpoint was detected yet. Choose how you want to run models:");
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("1. Ollama (recommended): install Ollama, then pull any model (e.g. qwen3.5:9b, llama3.2).").size(12.0).color(TEXT_MUTED));
+                    ui.label(RichText::new("2. OpenAI-Compatible: point to LM Studio, llama-server, or vLLM.").size(12.0).color(TEXT_MUTED));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Open Provider / Pull Model...").clicked() {
+                            self.show_onboarding = false;
+                            self.show_provider_modal = true;
+                        }
+                        if ui.button("Retry Connection").clicked() {
+                            self.show_onboarding = false;
+                            self.refresh_models(&ctx);
+                        }
+                        if ui.button("Dismiss").clicked() {
+                            self.show_onboarding = false;
                         }
                     });
                 });
@@ -1554,10 +1681,7 @@ fn run_agent_loop(
 }
 
 fn state_path() -> PathBuf {
-    let base = std::env::var("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    base.join("Yokahu").join("state.json")
+    mcp_client::app_data_dir().join("state.json")
 }
 
 fn load_state() -> PersistedState {

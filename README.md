@@ -22,8 +22,10 @@
 - **Workspace Agent & Safety Modes**:
   - Pick any local folder so the model can `list_dir`, `read_file`, `search_files`, `write_file`, and `run_command`.
   - Switch between `Safe (Ask Writes)`, `Read-Only`, and `Auto-Approve`.
-- **Bundled `qwen-mcp` Server**:
-  - Included zero-dependency Rust stdio MCP server (`qwen_ask`, `qwen_analyze_file`, `qwen_batch`, `qwen_status`) for delegating tasks to a local Ollama model from Antigravity or Yokahu itself.
+- **Bundled `yokahu-mcp` Server**:
+  - Included zero-dependency Rust stdio MCP server (`qwen_ask`, `qwen_analyze_file`, `qwen_batch`, `qwen_status`) for delegating tasks to any local Ollama model (`YOKAHU_MODEL`).
+- **In-App MCP Generator & Starters**:
+  - Scaffold a new Python or Rust MCP server directly from **MCP Servers** in Yokahu, or copy from `examples/custom-mcp/`.
 
 ---
 

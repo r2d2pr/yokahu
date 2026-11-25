@@ -1,11 +1,13 @@
-use qwen_local::json::{self, obj, Json};
-use qwen_local::ollama;
+use yokahu::json::{self, obj, Json};
+use yokahu::ollama;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 fn default_model() -> String {
-    std::env::var("QWEN_SLAVE_MODEL").unwrap_or_else(|_| "qwen3.5:9b".to_string())
+    std::env::var("YOKAHU_MODEL")
+        .or_else(|_| std::env::var("QWEN_SLAVE_MODEL"))
+        .unwrap_or_else(|_| "qwen3.5:9b".to_string())
 }
 
 fn default_num_ctx() -> i64 {
