@@ -241,6 +241,7 @@ pub struct YokahuApp {
     pub preview_file: Option<(String, PathBuf, String)>,
     pub new_persona_name: String,
     pub renaming_chat: Option<(String, String)>,
+    pub recording_mic: bool,
     pub logo_tex: Option<egui::TextureHandle>,
     pub status_note: String,
 }
@@ -325,6 +326,7 @@ impl YokahuApp {
             preview_file: None,
             new_persona_name: String::new(),
             renaming_chat: None,
+            recording_mic: false,
             logo_tex,
             status_note: String::new(),
         };
@@ -1218,7 +1220,7 @@ impl eframe::App for YokahuApp {
                                     }
                                 }
                             }
-                            if ui.button("Voice...").on_hover_text("Transcribe audio via local Whisper CLI").clicked() {
+                            if ui.button("Voice...").on_hover_text("Transcribe audio file via Whisper CLI").clicked() {
                                 if let Some(audio) = rfd::FileDialog::new()
                                     .add_filter("Audio", &["wav", "mp3", "m4a", "ogg", "flac"])
                                     .pick_file()
@@ -1228,6 +1230,33 @@ impl eframe::App for YokahuApp {
                                     let ctx_c = ctx.clone();
                                     self.status_note = "Transcribing audio...".to_string();
                                     thread::spawn(move || transcribe_audio(&cli, &audio, &tx, &ctx_c));
+                                }
+                            }
+                            #[cfg(windows)]
+                            {
+                                let mic_btn = if self.recording_mic {
+                                    egui::Button::new(RichText::new("Stop Rec").color(Color32::WHITE)).fill(RED)
+                                } else {
+                                    egui::Button::new("Mic")
+                                };
+                                if ui.add(mic_btn).on_hover_text("Record live microphone & transcribe via Whisper").clicked() {
+                                    if !self.recording_mic {
+                                        if start_mic_recording() {
+                                            self.recording_mic = true;
+                                            self.status_note = "Recording mic...".to_string();
+                                        } else {
+                                            self.status_note = "Mic record failed".to_string();
+                                        }
+                                    } else {
+                                        self.recording_mic = false;
+                                        if let Some(wav) = stop_mic_recording() {
+                                            let cli = self.state.whisper_cli.clone();
+                                            let tx = self.tx.clone();
+                                            let ctx_c = ctx.clone();
+                                            self.status_note = "Transcribing recording...".to_string();
+                                            thread::spawn(move || transcribe_audio(&cli, &wav, &tx, &ctx_c));
+                                        }
+                                    }
                                 }
                             }
                             let est_chars: usize = self
@@ -1665,4 +1694,33 @@ fn transcribe_audio(cli: &str, audio: &Path, tx: &Sender<WorkerEvent>, ctx: &egu
         }
     }
     ctx.request_repaint();
+}
+
+#[cfg(windows)]
+#[link(name = "winmm")]
+extern "system" {
+    fn mciSendStringA(lpszCommand: *const u8, lpszReturnString: *mut u8, cchReturn: u32, hwndCallback: usize) -> u32;
+}
+
+#[cfg(windows)]
+fn mci_cmd(cmd: &str) -> bool {
+    let mut buf = cmd.as_bytes().to_vec();
+    buf.push(0);
+    unsafe { mciSendStringA(buf.as_ptr(), std::ptr::null_mut(), 0, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn start_mic_recording() -> bool {
+    let _ = mci_cmd("close yokahu_mic");
+    mci_cmd("open new Type waveaudio Alias yokahu_mic") && mci_cmd("record yokahu_mic")
+}
+
+#[cfg(windows)]
+fn stop_mic_recording() -> Option<PathBuf> {
+    let path = std::env::temp_dir().join("yokahu_mic.wav");
+    let _ = fs::remove_file(&path);
+    let _ = mci_cmd("stop yokahu_mic");
+    let ok = mci_cmd(&format!("save yokahu_mic \"{}\"", path.display()));
+    let _ = mci_cmd("close yokahu_mic");
+    if ok && path.exists() { Some(path) } else { None }
 }

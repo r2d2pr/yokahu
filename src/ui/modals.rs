@@ -364,40 +364,53 @@ pub fn render_modals(app: &mut YokahuApp, ctx: &egui::Context, th: &ThemeConfig)
             });
     }
 
-    if let Some((fname, fpath, fbody)) = app.preview_file.clone() {
+    if let Some((fname, fpath, mut fbody)) = app.preview_file.clone() {
         let mut open = true;
-        egui::Window::new(format!("Preview: {}", fname))
+        let mut close_now = false;
+        egui::Window::new(format!("Editor / Preview: {}", fname))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_size([640.0, 480.0])
+            .default_size([660.0, 500.0])
             .show(ctx, |ui| {
                 ui.label(RichText::new(fpath.display().to_string()).size(11.0).color(th.c_muted()));
                 ui.separator();
+                let mut edited = false;
                 egui::ScrollArea::both().max_height(380.0).show(ui, |ui| {
-                    ui.label(
-                        RichText::new(&fbody)
-                            .font(FontId::new(12.5, FontFamily::Monospace))
-                            .color(th.c_text()),
-                    );
+                    let te = egui::TextEdit::multiline(&mut fbody)
+                        .font(FontId::new(12.5, FontFamily::Monospace))
+                        .desired_width(ui.available_width())
+                        .desired_rows(20);
+                    if ui.add(te).changed() {
+                        edited = true;
+                    }
                 });
+                if edited {
+                    app.preview_file = Some((fname.clone(), fpath.clone(), fbody.clone()));
+                }
                 ui.separator();
                 ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        match std::fs::write(&fpath, &fbody) {
+                            Ok(_) => app.status_note = format!("Saved {}", fname),
+                            Err(e) => app.status_note = format!("Save failed: {}", e),
+                        }
+                    }
                     if ui.button("Attach to Chat").clicked() {
                         if let Some(att) = read_attachment(ctx, &fpath) {
                             app.attachments.push(att);
                         }
-                        app.preview_file = None;
+                        close_now = true;
                     }
                     if ui.button("Copy").clicked() {
                         ctx.copy_text(fbody);
                     }
                     if ui.button("Close").clicked() {
-                        app.preview_file = None;
+                        close_now = true;
                     }
                 });
             });
-        if !open {
+        if !open || close_now {
             app.preview_file = None;
         }
     }
