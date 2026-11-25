@@ -1,15 +1,18 @@
 pub mod agent;
 pub mod icons;
 pub mod modals;
+pub mod panels;
 
 use crate::markdown;
 use crate::mcp_client::{self, DiscoveredMcpTool, McpConfigFile, McpPool};
 use crate::ollama;
+use crate::rag;
 use crate::skills;
 use crate::theme::{self, ThemeConfig};
 use crate::tools::{self, BackgroundTasks, SafetyMode, WorkspaceEntry};
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, RichText, Stroke};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,6 +117,39 @@ pub struct Conversation {
     pub messages: Vec<ChatMessage>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WorkflowMacro {
+    pub name: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub interval_secs: u64,
+    #[serde(default)]
+    pub last_run_epoch: u64,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct ModelStats {
+    pub requests: u64,
+    pub tokens: u64,
+    pub secs: f32,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct UsageStats {
+    pub total_requests: u64,
+    pub total_tokens: u64,
+    pub total_secs: f32,
+    #[serde(default)]
+    pub per_model: BTreeMap<String, ModelStats>,
+}
+
+pub struct OpenFileTab {
+    pub name: String,
+    pub path: PathBuf,
+    pub content: String,
+    pub dirty: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistedState {
@@ -147,6 +183,10 @@ pub struct PersistedState {
     pub worker_model: String,
     #[serde(default = "default_true")]
     pub include_antigravity_skills: bool,
+    #[serde(default)]
+    pub workflows: Vec<WorkflowMacro>,
+    #[serde(default)]
+    pub stats: UsageStats,
 }
 
 fn default_true() -> bool {
@@ -178,6 +218,8 @@ impl Default for PersistedState {
             web_tools_enabled: false,
             worker_model: "qwen3.5:9b".to_string(),
             include_antigravity_skills: true,
+            workflows: Vec::new(),
+            stats: UsageStats::default(),
         }
     }
 }
@@ -216,6 +258,9 @@ pub enum WorkerEvent {
     Token(String),
     CompareToken(String),
     Transcript(String),
+    TerminalOut(String),
+    UpdateStatus(String),
+    RagStatus(String),
     Focus(String),
     Steps(Vec<TaskStep>),
     AskQuestion(PendingQuestion),
@@ -276,6 +321,18 @@ pub struct YokahuApp {
     pub focus_text: String,
     pub pending_question: Option<PendingQuestion>,
     pub question_custom: String,
+    pub open_tabs: Vec<OpenFileTab>,
+    pub active_tab_idx: usize,
+    pub show_terminal: bool,
+    pub term_input: String,
+    pub term_output: String,
+    pub show_workflows_modal: bool,
+    pub new_wf_name: String,
+    pub new_wf_prompt: String,
+    pub new_wf_interval: u64,
+    pub show_stats_modal: bool,
+    pub update_status: String,
+    pub rag_status: String,
     pub logo_tex: Option<egui::TextureHandle>,
     pub status_note: String,
 }
@@ -366,6 +423,18 @@ impl YokahuApp {
             focus_text: String::new(),
             pending_question: None,
             question_custom: String::new(),
+            open_tabs: Vec::new(),
+            active_tab_idx: 0,
+            show_terminal: false,
+            term_input: String::new(),
+            term_output: String::new(),
+            show_workflows_modal: false,
+            new_wf_name: String::new(),
+            new_wf_prompt: String::new(),
+            new_wf_interval: 0,
+            show_stats_modal: false,
+            update_status: String::new(),
+            rag_status: String::new(),
             logo_tex,
             status_note: String::new(),
         };
@@ -426,7 +495,7 @@ impl YokahuApp {
         });
     }
 
-    fn send_message(&mut self, ctx: &egui::Context) {
+    pub fn send_message(&mut self, ctx: &egui::Context) {
         if self.busy {
             return;
         }
@@ -725,6 +794,9 @@ impl eframe::App for YokahuApp {
                     }
                     self.prompt_input.push_str(&text);
                 }
+                WorkerEvent::TerminalOut(out) => self.term_output = out,
+                WorkerEvent::UpdateStatus(msg) => self.update_status = msg,
+                WorkerEvent::RagStatus(msg) => self.rag_status = msg,
                 WorkerEvent::Focus(f) => self.focus_text = f,
                 WorkerEvent::Steps(s) => self.task_steps = s,
                 WorkerEvent::AskQuestion(q) => {
@@ -775,8 +847,35 @@ impl eframe::App for YokahuApp {
                     self.pending_approval = None;
                     self.pending_question = None;
                     self.focus_text.clear();
+                    if self.tok_count > 0 {
+                        let secs = self.gen_start.map(|s| s.elapsed().as_secs_f32()).unwrap_or(0.1);
+                        self.state.stats.total_requests += 1;
+                        self.state.stats.total_tokens += self.tok_count as u64;
+                        self.state.stats.total_secs += secs;
+                        let entry = self.state.stats.per_model.entry(self.state.model.clone()).or_default();
+                        entry.requests += 1;
+                        entry.tokens += self.tok_count as u64;
+                        entry.secs += secs;
+                    }
                     save_state(&self.state);
                 }
+            }
+        }
+
+        // Scheduled workflow macro check
+        if !self.busy && !self.state.workflows.is_empty() {
+            let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let mut due_prompt: Option<String> = None;
+            for wf in &mut self.state.workflows {
+                if wf.interval_secs > 0 && now_secs.saturating_sub(wf.last_run_epoch) >= wf.interval_secs {
+                    wf.last_run_epoch = now_secs;
+                    due_prompt = Some(wf.prompt.clone());
+                    break;
+                }
+            }
+            if let Some(p) = due_prompt {
+                self.prompt_input = p;
+                self.send_message(&ctx);
             }
         }
 
@@ -986,13 +1085,53 @@ impl eframe::App for YokahuApp {
                             let ws_label = self.state.workspace.as_deref().unwrap_or("No workspace selected");
                             ui.label(RichText::new(truncate(ws_label, 36)).size(11.0).color(th.c_muted()));
                             if let Some(ws) = &self.state.workspace {
-                                if ui.small_button("Edit .yokahu.md").clicked() {
-                                    let mem = Path::new(ws).join(".yokahu.md");
-                                    if !mem.exists() {
-                                        let _ = fs::write(&mem, "# Project Memory\n\nAdd workspace conventions and context here.\n");
+                                let ws_path = PathBuf::from(ws);
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.small_button("Edit .yokahu.md").clicked() {
+                                        let mem = ws_path.join(".yokahu.md");
+                                        if !mem.exists() {
+                                            let _ = fs::write(&mem, "# Project Memory\n\nAdd workspace conventions and context here.\n");
+                                        }
+                                        if let Ok(body) = safe_read_preview(&mem) {
+                                            self.open_tabs.push(OpenFileTab { name: ".yokahu.md".to_string(), path: mem, content: body, dirty: false });
+                                            self.active_tab_idx = self.open_tabs.len() - 1;
+                                        }
                                     }
-                                    let body = safe_read_preview(&mem).unwrap_or_default();
-                                    self.preview_file = Some((".yokahu.md".to_string(), mem, body));
+                                    if ui.small_button("Git Status").clicked() {
+                                        let st = tools::run_git(Some(&ws_path), &["status", "--short"]);
+                                        self.term_output = format!("$ git status --short\n{}", st);
+                                        self.show_terminal = true;
+                                    }
+                                    if ui.small_button("Review Diff").clicked() && !self.busy {
+                                        let diff = tools::run_git(Some(&ws_path), &["diff"]);
+                                        self.prompt_input = format!("Review this git diff for bugs, security, and improvements:\n```diff\n{}\n```", diff);
+                                        self.send_message(&ctx);
+                                    }
+                                    if ui.small_button("AI Commit Msg").clicked() && !self.busy {
+                                        let diff = tools::run_git(Some(&ws_path), &["diff", "--staged"]);
+                                        let diff = if diff.contains("clean") { tools::run_git(Some(&ws_path), &["diff"]) } else { diff };
+                                        self.prompt_input = format!("Write a concise conventional commit message for this diff:\n```diff\n{}\n```", diff);
+                                        self.send_message(&ctx);
+                                    }
+                                    if ui.small_button("Index RAG").clicked() {
+                                        let url = self.state.base_url.clone();
+                                        let m = self.state.model.clone();
+                                        let w = ws_path.clone();
+                                        let tx = self.tx.clone();
+                                        let ctx_c = ctx.clone();
+                                        self.rag_status = "Indexing...".to_string();
+                                        thread::spawn(move || {
+                                            let msg = match rag::index_workspace(&url, &m, &w) {
+                                                Ok(n) => format!("Indexed {} chunks", n),
+                                                Err(e) => format!("RAG error: {}", e),
+                                            };
+                                            let _ = tx.send(WorkerEvent::RagStatus(msg));
+                                            ctx_c.request_repaint();
+                                        });
+                                    }
+                                });
+                                if !self.rag_status.is_empty() {
+                                    ui.label(RichText::new(&self.rag_status).size(11.0).color(th.c_accent()));
                                 }
                             }
                             ui.add_space(6.0);
@@ -1012,11 +1151,22 @@ impl eframe::App for YokahuApp {
                                                 .selectable_label(false, RichText::new(label).size(12.0).color(th.c_text()))
                                                 .clicked()
                                             {
-                                                let body = match safe_read_preview(&entry.path) {
-                                                    Ok(text) => text,
-                                                    Err(msg) => msg,
-                                                };
-                                                self.preview_file = Some((entry.name.clone(), entry.path.clone(), body));
+                                                if let Some(pos) = self.open_tabs.iter().position(|t| t.path == entry.path) {
+                                                    self.active_tab_idx = pos;
+                                                } else {
+                                                    match safe_read_preview(&entry.path) {
+                                                        Ok(body) => {
+                                                            self.open_tabs.push(OpenFileTab {
+                                                                name: entry.name.clone(),
+                                                                path: entry.path.clone(),
+                                                                content: body,
+                                                                dirty: false,
+                                                            });
+                                                            self.active_tab_idx = self.open_tabs.len() - 1;
+                                                        }
+                                                        Err(msg) => self.status_note = msg,
+                                                    }
+                                                }
                                             }
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                 if icons::plus_button(ui, "Attach to chat").clicked() {
@@ -1189,6 +1339,12 @@ impl eframe::App for YokahuApp {
                                 if ui.add_sized([ui.available_width(), 28.0], egui::Button::new("Appearance & Colors...")).clicked() {
                                     self.show_theme_modal = true;
                                 }
+                                if ui.add_sized([ui.available_width(), 28.0], egui::Button::new("Workflows & Macros...")).clicked() {
+                                    self.show_workflows_modal = true;
+                                }
+                                if ui.add_sized([ui.available_width(), 28.0], egui::Button::new("Stats, Backup & Updates...")).clicked() {
+                                    self.show_stats_modal = true;
+                                }
                             });
                         }
                     }
@@ -1232,9 +1388,15 @@ impl eframe::App for YokahuApp {
                         if ui.small_button("Export .json").clicked() {
                             self.export_active_chat(true);
                         }
+                        if ui.small_button(if self.show_terminal { "Hide Term" } else { "Terminal" }).clicked() {
+                            self.show_terminal = !self.show_terminal;
+                        }
                     });
                 });
             });
+
+        panels::render_editor_panel(self, &ctx, ui, &th);
+        panels::render_terminal_drawer(self, &ctx, ui, &th);
 
         // Composer
         egui::Panel::bottom("composer")
@@ -1730,6 +1892,7 @@ impl eframe::App for YokahuApp {
             });
 
         modals::render_modals(self, &ctx, &th);
+        panels::render_extra_modals(self, &ctx, &th);
     }
 }
 

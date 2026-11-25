@@ -1,4 +1,5 @@
 use crate::mcp_client::{self, DiscoveredMcpTool, McpConfigFile, McpPool};
+use crate::rag;
 use crate::skills;
 use crate::tools::{self, BackgroundTasks, SafetyMode};
 use crate::ui::{ChatMessage, PendingApproval, PendingQuestion, ProviderKind, TaskStep, WorkerEvent};
@@ -482,6 +483,16 @@ pub fn run_agent_loop(
                 let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
                 let id = args.get("id").and_then(|v| v.as_u64());
                 bg_tasks.manage(action, id)
+            } else if name == "semantic_search" {
+                let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                match rag::search(&base_url, query, 5) {
+                    Ok(hits) => hits
+                        .into_iter()
+                        .map(|(score, c)| format!("[{:.2}] {}:{}\n{}\n", score, c.path, c.start_line, c.text))
+                        .collect::<Vec<_>>()
+                        .join("\n---\n"),
+                    Err(e) => e,
+                }
             } else {
                 tools::execute_tool(workspace.as_deref(), name, &args)
             };

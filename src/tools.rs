@@ -165,6 +165,36 @@ pub fn ollama_tools_schema() -> Value {
                     "required": ["action"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "git_status",
+                "description": "Run `git status --short` in the workspace.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "git_diff",
+                "description": "Run `git diff` in the workspace (truncated to 12 KB).",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "semantic_search",
+                "description": "Search the indexed workspace semantically using local embeddings (RAG).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Natural language query." }
+                    },
+                    "required": ["query"]
+                }
+            }
         }
     ])
 }
@@ -672,6 +702,8 @@ pub fn execute_tool(workspace: Option<&Path>, name: &str, args: &Value) -> Strin
                 found.join("\n")
             }
         }
+        "git_status" => run_git(workspace, &["status", "--short"]),
+        "git_diff" => run_git(workspace, &["diff"]),
         "run_command" => {
             let cmd_str = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let mut cmd = Command::new("powershell");
@@ -690,6 +722,26 @@ pub fn execute_tool(workspace: Option<&Path>, name: &str, args: &Value) -> Strin
             }
         }
         other => format!("Unknown tool: {}", other),
+    }
+}
+
+pub fn run_git(workspace: Option<&Path>, args: &[&str]) -> String {
+    let mut cmd = Command::new("git");
+    cmd.args(args);
+    if let Some(ws) = workspace {
+        cmd.current_dir(ws);
+    }
+    match cmd.output() {
+        Ok(out) => {
+            let s = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let trimmed: String = s.chars().take(12000).collect();
+            if trimmed.trim().is_empty() { "(clean / empty)".to_string() } else { trimmed }
+        }
+        Err(e) => format!("git error: {}", e),
     }
 }
 

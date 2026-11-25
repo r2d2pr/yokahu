@@ -3459,7 +3459,7 @@ dependencies = [
 
 [[package]]
 name = "yokahu"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "arboard",
  "eframe",

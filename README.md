@@ -26,6 +26,12 @@
   - Persistent stdio MCP process pool + Streamable HTTP/HTTPS support via **MCP Servers** or `%LOCALAPPDATA%\Yokahu\mcp_config.json`.
   - In-app **New MCP Server** generator (scaffolds a Python or Rust MCP server and auto-registers it) + starter templates in `examples/custom-mcp/`.
   - Includes `yokahu-mcp` (`qwen_ask`, `qwen_analyze_file`, `qwen_batch`, `qwen_status`).
+- **Git, Terminal, RAG & Multi-Tab Editor (1.0.0)**:
+  - **Git Integration**: `Git Status`, `Review Diff`, and `AI Commit Msg` in `Files` tab + `git_status` / `git_diff` agent tools.
+  - **Interactive Terminal & Background Tasks**: Toggleable bottom `Terminal` drawer to run commands and manage background tasks.
+  - **Local Semantic Search (RAG)**: `Index RAG` embeds workspace files via Ollama `/api/embed` for `semantic_search`.
+  - **Split-Pane Multi-Tab Editor**: Open and edit multiple workspace files beside the chat.
+  - **Agentic Parity**: 25-step agent loop, `edit_file`, `find_files`, `update_steps` Task Checklist, `update_focus`, `ask_question` interactive cards, `invoke_subagent`, `SKILL.md` discovery, `/plan` `/grill-me` `/review` `/compact` slash commands, Workflows/Macros, Usage & Performance Dashboard, Backup/Restore, and Update Checker.
 - **Customizable Appearance & Power UX**:
   - 5 curated themes (`Obsidian Crimson`, `Midnight Blue`, `Emerald Slate`, `Apple Light`, `Pure Black`) + live RGB color pickers.
   - Saved **Personas**, `Ctrl+K` Command Palette, `Ctrl+V` clipboard image paste, `@filename` autocomplete, pinned/renamed chats, Read Aloud TTS, and live Mic / Whisper CLI transcription.

@@ -2,6 +2,7 @@ pub mod json;
 pub mod markdown;
 pub mod mcp_client;
 pub mod ollama;
+pub mod rag;
 pub mod skills;
 pub mod theme;
 pub mod tools;
