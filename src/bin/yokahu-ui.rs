@@ -52,6 +52,41 @@ struct Attachment {
     name: String,
     is_image: bool,
     data: String,
+    #[serde(skip)]
+    thumb: Option<egui::TextureHandle>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Persona {
+    name: String,
+    prompt: String,
+    #[serde(default)]
+    builtin: bool,
+}
+
+fn default_personas() -> Vec<Persona> {
+    vec![
+        Persona {
+            name: "General".to_string(),
+            prompt: "You are a local AI assistant running in Yokahu. Be concise, accurate, and practical.".to_string(),
+            builtin: true,
+        },
+        Persona {
+            name: "Systems Coder".to_string(),
+            prompt: "You are an expert Rust and systems engineer. Prefer zero-overhead, idiomatic, safe code and verify edge cases.".to_string(),
+            builtin: true,
+        },
+        Persona {
+            name: "Code Reviewer".to_string(),
+            prompt: "Review code strictly for correctness, security, concurrency bugs, and unnecessary complexity. Be direct.".to_string(),
+            builtin: true,
+        },
+        Persona {
+            name: "Concise".to_string(),
+            prompt: "Answer in terse, high-signal bullet points. No fluff.".to_string(),
+            builtin: true,
+        },
+    ]
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -92,6 +127,10 @@ struct PersistedState {
     safety_mode: SafetyMode,
     system_prompt: String,
     theme: ThemeConfig,
+    #[serde(default = "default_personas")]
+    personas: Vec<Persona>,
+    #[serde(default)]
+    active_persona: String,
 }
 
 impl Default for PersistedState {
@@ -111,6 +150,8 @@ impl Default for PersistedState {
             safety_mode: SafetyMode::Safe,
             system_prompt: "You are a local AI assistant running in Yokahu. Be concise, accurate, and practical.".to_string(),
             theme: ThemeConfig::default(),
+            personas: default_personas(),
+            active_persona: "General".to_string(),
         }
     }
 }
@@ -181,6 +222,10 @@ struct YokahuApp {
     tok_count: usize,
     gen_start: Option<Instant>,
     last_tok_per_sec: f32,
+    show_palette: bool,
+    palette_query: String,
+    preview_file: Option<(String, PathBuf, String)>,
+    new_persona_name: String,
     logo_tex: Option<egui::TextureHandle>,
     status_note: String,
 }
@@ -260,9 +305,16 @@ impl YokahuApp {
             tok_count: 0,
             gen_start: None,
             last_tok_per_sec: 0.0,
+            show_palette: false,
+            palette_query: String::new(),
+            preview_file: None,
+            new_persona_name: String::new(),
             logo_tex,
             status_note: String::new(),
         };
+        if app.state.personas.is_empty() {
+            app.state.personas = default_personas();
+        }
         if app.state.chats.is_empty() {
             app.new_chat();
         }
@@ -556,9 +608,43 @@ impl eframe::App for YokahuApp {
             }
         }
 
+        // Global keyboard shortcuts
+        let (k_new, k_side, k_pal, k_esc) = ctx.input(|i| {
+            let cmd = i.modifiers.command || i.modifiers.ctrl;
+            (
+                cmd && i.key_pressed(egui::Key::N),
+                cmd && i.key_pressed(egui::Key::B),
+                cmd && i.key_pressed(egui::Key::K),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if k_new && !self.busy {
+            self.new_chat();
+        }
+        if k_side {
+            self.show_sidebar = !self.show_sidebar;
+        }
+        if k_pal {
+            self.show_palette = !self.show_palette;
+            self.palette_query.clear();
+        }
+        if k_esc {
+            if self.busy {
+                self.cancel_flag.store(true, Ordering::Relaxed);
+            } else {
+                self.show_palette = false;
+                self.preview_file = None;
+                self.show_sys_modal = false;
+                self.show_provider_modal = false;
+                self.show_mcp_modal = false;
+                self.show_theme_modal = false;
+                self.show_onboarding = false;
+            }
+        }
+
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
-            if let Some(att) = read_attachment(f.path()) {
+            if let Some(att) = read_attachment(&ctx, f.path()) {
                 self.attachments.push(att);
             }
         }
@@ -681,13 +767,28 @@ impl eframe::App for YokahuApp {
                                     };
                                     if entry.is_dir {
                                         ui.label(RichText::new(label).size(12.0).color(th.c_muted()));
-                                    } else if ui
-                                        .selectable_label(false, RichText::new(label).size(12.0).color(th.c_text()))
-                                        .clicked()
-                                    {
-                                        if let Some(att) = read_attachment(&entry.path) {
-                                            self.attachments.push(att);
-                                        }
+                                    } else {
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .selectable_label(false, RichText::new(label).size(12.0).color(th.c_text()))
+                                                .clicked()
+                                            {
+                                                let body = match safe_read_preview(&entry.path) {
+                                                    Ok(text) => text,
+                                                    Err(msg) => msg,
+                                                };
+                                                self.preview_file = Some((entry.name.clone(), entry.path.clone(), body));
+                                            }
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if ui.small_button("+").on_hover_text("Attach to chat").clicked() {
+                                                    if let Some(att) = read_attachment(&ctx, &entry.path) {
+                                                        self.attachments.push(att);
+                                                    } else {
+                                                        self.status_note = "File too large or binary".to_string();
+                                                    }
+                                                }
+                                            });
+                                        });
                                     }
                                 }
                             });
@@ -750,6 +851,44 @@ impl eframe::App for YokahuApp {
                                 {
                                     save_state(&self.state);
                                 }
+                                ui.add_space(8.0);
+                                ui.separator();
+
+                                ui.label(RichText::new("Personas").size(12.0).strong().color(th.c_text()));
+                                let mut picked_persona: Option<Persona> = None;
+                                egui::ComboBox::from_id_salt("persona_combo")
+                                    .selected_text(&self.state.active_persona)
+                                    .show_ui(ui, |ui| {
+                                        for p in &self.state.personas {
+                                            if ui.selectable_label(self.state.active_persona == p.name, &p.name).clicked() {
+                                                picked_persona = Some(p.clone());
+                                            }
+                                        }
+                                    });
+                                if let Some(p) = picked_persona {
+                                    self.state.active_persona = p.name;
+                                    self.state.system_prompt = p.prompt;
+                                    save_state(&self.state);
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::TextEdit::singleline(&mut self.new_persona_name).hint_text("custom name").desired_width(120.0));
+                                    if ui.button("Save").clicked() && !self.new_persona_name.trim().is_empty() {
+                                        let name = self.new_persona_name.trim().to_string();
+                                        let prompt = self.state.system_prompt.clone();
+                                        self.state.personas.retain(|p| p.name != name);
+                                        self.state.personas.push(Persona { name: name.clone(), prompt, builtin: false });
+                                        self.state.active_persona = name;
+                                        self.new_persona_name.clear();
+                                        save_state(&self.state);
+                                    }
+                                    let is_custom = self.state.personas.iter().any(|p| p.name == self.state.active_persona && !p.builtin);
+                                    if is_custom && ui.button("Del").clicked() {
+                                        let cur = self.state.active_persona.clone();
+                                        self.state.personas.retain(|p| p.name != cur);
+                                        self.state.active_persona = "General".to_string();
+                                        save_state(&self.state);
+                                    }
+                                });
                                 ui.add_space(8.0);
                                 ui.separator();
 
@@ -831,6 +970,9 @@ impl eframe::App for YokahuApp {
                         ui.horizontal_wrapped(|ui| {
                             let mut rem: Option<usize> = None;
                             for (i, att) in self.attachments.iter().enumerate() {
+                                if let Some(tex) = &att.thumb {
+                                    ui.image((tex.id(), egui::vec2(36.0, 36.0)));
+                                }
                                 ui.label(RichText::new(&att.name).size(11.5).color(th.c_accent()));
                                 if ui.small_button("x").clicked() {
                                     rem = Some(i);
@@ -866,7 +1008,7 @@ impl eframe::App for YokahuApp {
                         if ui.button("Attach File...").clicked() {
                             if let Some(files) = rfd::FileDialog::new().pick_files() {
                                 for p in files {
-                                    if let Some(att) = read_attachment(&p) {
+                                    if let Some(att) = read_attachment(&ctx, &p) {
                                         self.attachments.push(att);
                                     }
                                 }
@@ -1458,6 +1600,108 @@ impl eframe::App for YokahuApp {
                     }
                 });
         }
+
+        // File Preview Modal (capped at 256 KB / 2000 lines)
+        if let Some((fname, fpath, fbody)) = self.preview_file.clone() {
+            let mut open = true;
+            egui::Window::new(format!("Preview: {}", fname))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([640.0, 480.0])
+                .show(&ctx, |ui| {
+                    ui.label(RichText::new(fpath.display().to_string()).size(11.0).color(th.c_muted()));
+                    ui.separator();
+                    egui::ScrollArea::both().max_height(380.0).show(ui, |ui| {
+                        ui.label(
+                            RichText::new(&fbody)
+                                .font(FontId::new(12.5, FontFamily::Monospace))
+                                .color(th.c_text()),
+                        );
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Attach to Chat").clicked() {
+                            if let Some(att) = read_attachment(&ctx, &fpath) {
+                                self.attachments.push(att);
+                            }
+                            self.preview_file = None;
+                        }
+                        if ui.button("Copy").clicked() {
+                            ctx.copy_text(fbody);
+                        }
+                        if ui.button("Close").clicked() {
+                            self.preview_file = None;
+                        }
+                    });
+                });
+            if !open {
+                self.preview_file = None;
+            }
+        }
+
+        // Command Palette (Ctrl+K)
+        if self.show_palette {
+            egui::Window::new("Command Palette (Ctrl+K)")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0])
+                .default_width(480.0)
+                .show(&ctx, |ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.palette_query)
+                            .hint_text("Jump to chat, model, theme, or persona...")
+                            .desired_width(ui.available_width()),
+                    );
+                    resp.request_focus();
+                    let q = self.palette_query.to_lowercase();
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                        for c in &self.state.chats {
+                            if q.is_empty() || c.title.to_lowercase().contains(&q) {
+                                if ui.selectable_label(false, format!("[Chat] {}", c.title)).clicked() {
+                                    self.state.active_id = Some(c.id.clone());
+                                    self.show_palette = false;
+                                    save_state(&self.state);
+                                }
+                            }
+                        }
+                        for m in &self.models {
+                            if q.is_empty() || m.to_lowercase().contains(&q) {
+                                if ui.selectable_label(false, format!("[Model] {}", m)).clicked() {
+                                    self.state.model = m.clone();
+                                    self.show_palette = false;
+                                    save_state(&self.state);
+                                }
+                            }
+                        }
+                        for p in &self.state.personas {
+                            if q.is_empty() || p.name.to_lowercase().contains(&q) {
+                                if ui.selectable_label(false, format!("[Persona] {}", p.name)).clicked() {
+                                    self.state.active_persona = p.name.clone();
+                                    self.state.system_prompt = p.prompt.clone();
+                                    self.show_palette = false;
+                                    save_state(&self.state);
+                                }
+                            }
+                        }
+                        for tname in ThemeConfig::presets() {
+                            if q.is_empty() || tname.to_lowercase().contains(&q) {
+                                if ui.selectable_label(false, format!("[Theme] {}", tname)).clicked() {
+                                    self.state.theme = ThemeConfig::preset(tname);
+                                    theme::apply_theme(&ctx, &self.state.theme);
+                                    self.show_palette = false;
+                                    save_state(&self.state);
+                                }
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    if ui.button("Close (Esc)").clicked() {
+                        self.show_palette = false;
+                    }
+                });
+        }
     }
 }
 
@@ -1730,6 +1974,7 @@ fn run_agent_loop(
 
         let mut assistant_text = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
+        let mut oai_tc_acc: BTreeMap<usize, (String, String, String)> = BTreeMap::new();
         let mut line_buf = String::new();
 
         while let Some(chunk) = read_chunk_or_line(&mut reader, chunked) {
@@ -1789,12 +2034,36 @@ fn run_agent_loop(
                                     }
                                 }
                                 if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
-                                    tool_calls.extend(tcs.iter().cloned());
+                                    for tc in tcs {
+                                        let idx = tc.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                                        let entry = oai_tc_acc.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                                        if let Some(id) = tc.get("id").and_then(|x| x.as_str()) {
+                                            entry.0.push_str(id);
+                                        }
+                                        if let Some(f) = tc.get("function") {
+                                            if let Some(n) = f.get("name").and_then(|x| x.as_str()) {
+                                                entry.1.push_str(n);
+                                            }
+                                            if let Some(a) = f.get("arguments").and_then(|x| x.as_str()) {
+                                                entry.2.push_str(a);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        if prov == ProviderKind::OpenAiCompat && !oai_tc_acc.is_empty() {
+            for (_idx, (id, name, args)) in oai_tc_acc {
+                tool_calls.push(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args }
+                }));
             }
         }
 
@@ -1809,6 +2078,7 @@ fn run_agent_loop(
         }));
 
         for tc in tool_calls {
+            let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let func = tc.get("function").unwrap_or(&tc);
             let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = match func.get("arguments") {
@@ -1865,7 +2135,11 @@ fn run_agent_loop(
                 output: output.clone(),
             });
             ctx.request_repaint();
-            api_msgs.push(json!({ "role": "tool", "content": output }));
+            if prov == ProviderKind::OpenAiCompat && !tc_id.is_empty() {
+                api_msgs.push(json!({ "role": "tool", "tool_call_id": tc_id, "content": output }));
+            } else {
+                api_msgs.push(json!({ "role": "tool", "content": output }));
+            }
         }
     }
 
@@ -1894,23 +2168,55 @@ fn save_state(state: &PersistedState) {
     }
 }
 
-fn read_attachment(path: &Path) -> Option<Attachment> {
+fn safe_read_preview(path: &Path) -> Result<String, String> {
+    let meta = fs::metadata(path).map_err(|e| format!("Cannot stat file: {}", e))?;
+    if meta.len() > 256 * 1024 {
+        return Err(format!(
+            "File too large ({:.1} KB > 256 KB limit) to preview safely.",
+            meta.len() as f64 / 1024.0
+        ));
+    }
+    let bytes = fs::read(path).map_err(|e| format!("Cannot read file: {}", e))?;
+    if bytes.iter().take(4096).any(|&b| b == 0) {
+        return Err("Binary file — preview disabled.".to_string());
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<&str> = text.lines().take(2000).collect();
+    if text.lines().count() > 2000 {
+        lines.push("\n... (truncated at 2000 lines)");
+    }
+    Ok(lines.join("\n"))
+}
+
+fn read_attachment(ctx: &egui::Context, path: &Path) -> Option<Attachment> {
     let name = path.file_name()?.to_string_lossy().to_string();
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif");
     if is_image {
         let bytes = fs::read(path).ok()?;
+        let thumb = image::load_from_memory(&bytes).ok().map(|img| {
+            let rgba = img.thumbnail(96, 96).to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let color_img = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+            ctx.load_texture(format!("att_{}", name), color_img, egui::TextureOptions::LINEAR)
+        });
         Some(Attachment {
             name,
             is_image: true,
             data: encode_base64(&bytes),
+            thumb,
         })
     } else {
+        let meta = fs::metadata(path).ok()?;
+        if meta.len() > 512 * 1024 {
+            return None;
+        }
         let text = fs::read_to_string(path).ok()?;
         Some(Attachment {
             name,
             is_image: false,
             data: text,
+            thumb: None,
         })
     }
 }
