@@ -164,3 +164,22 @@ fn build_inline_job(th: &ThemeConfig, line: &str) -> LayoutJob {
     }
     job
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_numbered_lists() {
+        assert_eq!(parse_numbered("1. hello"), Some(("1", "hello")));
+        assert_eq!(parse_numbered("12. item"), Some(("12", "item")));
+        assert_eq!(parse_numbered("abc. nope"), None);
+    }
+
+    #[test]
+    fn inline_job_handles_code_and_bold() {
+        let th = ThemeConfig::default();
+        let job = build_inline_job(&th, "Use `cargo test` for **fast** checks");
+        assert!(job.sections.len() >= 4);
+    }
+}

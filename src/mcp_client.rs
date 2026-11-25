@@ -2,12 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
-use std::time::Duration;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -138,41 +136,18 @@ fn spawn_and_exchange(cfg: &McpServerConfig, requests: &[Value]) -> Result<Vec<V
 }
 
 fn http_post_json(url: &str, body: &Value) -> Result<Value, String> {
-    let trimmed = url.trim().trim_end_matches('/');
-    let without_scheme = trimmed
-        .strip_prefix("http://")
-        .ok_or_else(|| "Streamable HTTP currently supports http:// local/LAN URLs".to_string())?;
-    let (host_port, path) = match without_scheme.split_once('/') {
-        Some((hp, p)) => (hp, format!("/{}", p)),
-        None => (without_scheme, "/".to_string()),
-    };
-    let (host, port) = if let Some((h, p)) = host_port.rsplit_once(':') {
-        (h.to_string(), p.parse::<u16>().unwrap_or(80))
-    } else {
-        (host_port.to_string(), 80)
-    };
-    let addr: SocketAddr = format!("{}:{}", host, port)
-        .parse()
-        .map_err(|e| format!("Invalid MCP URL {}: {}", url, e))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| format!("MCP HTTP connect failed: {}", e))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
-
     let payload = body.to_string();
-    let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path,
-        host,
-        port,
-        payload.len(),
-        payload
-    );
-    stream.write_all(req.as_bytes()).map_err(|e| format!("Write error: {}", e))?;
+    let mut resp = ureq::post(url.trim())
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .send(payload.as_str())
+        .map_err(|e| format!("MCP HTTP error: {}", e))?;
 
-    let mut raw = String::new();
-    stream.read_to_string(&mut raw).map_err(|e| format!("Read error: {}", e))?;
-    let body_part = raw.split("\r\n\r\n").nth(1).unwrap_or(&raw);
-    for line in body_part.lines() {
+    let raw = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("MCP HTTP read error: {}", e))?;
+    for line in raw.lines() {
         let t = line.trim();
         let clean = t.strip_prefix("data:").map(|s| s.trim()).unwrap_or(t);
         if clean.starts_with('{') {
@@ -569,5 +544,41 @@ fn main() {
             url: String::new(),
             enabled: true,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_config_roundtrip() {
+        let mut cfg = McpConfigFile::default();
+        cfg.mcp_servers.insert(
+            "demo".to_string(),
+            McpServerConfig {
+                command: "python".to_string(),
+                args: vec!["server.py".to_string()],
+                env: BTreeMap::new(),
+                url: String::new(),
+                enabled: true,
+            },
+        );
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: McpConfigFile = serde_json::from_str(&json).unwrap();
+        assert!(parsed.mcp_servers.contains_key("demo"));
+    }
+
+    #[test]
+    fn to_tool_schemas_prefixes_name() {
+        let tools = vec![DiscoveredMcpTool {
+            server_name: "srv".to_string(),
+            tool_name: "ping".to_string(),
+            full_name: "mcp__srv__ping".to_string(),
+            description: "desc".to_string(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let schemas = to_tool_schemas(&tools);
+        assert_eq!(schemas[0]["function"]["name"], "mcp__srv__ping");
     }
 }

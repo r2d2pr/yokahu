@@ -1,0 +1,372 @@
+use crate::mcp_client::{self, DiscoveredMcpTool, McpConfigFile, McpPool};
+use crate::tools::{self, SafetyMode};
+use crate::ui::{ChatMessage, PendingApproval, ProviderKind, WorkerEvent};
+use eframe::egui;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
+use std::time::Duration;
+
+fn build_url(base_url: &str, subpath: &str) -> String {
+    format!("{}{}", base_url.trim().trim_end_matches('/'), subpath)
+}
+
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(600)))
+        .build()
+        .into()
+}
+
+pub fn fetch_models(
+    prov: ProviderKind,
+    base_url: &str,
+    api_key: &str,
+    tx: &Sender<WorkerEvent>,
+    ctx: &egui::Context,
+) {
+    let subpath = match prov {
+        ProviderKind::Ollama => "/api/tags",
+        ProviderKind::OpenAiCompat => "/models",
+    };
+    let url = build_url(base_url, subpath);
+    let mut req = agent().get(&url);
+    if !api_key.trim().is_empty() {
+        req = req.header("Authorization", &format!("Bearer {}", api_key.trim()));
+    }
+    let Ok(mut resp) = req.call() else {
+        let _ = tx.send(WorkerEvent::Models(Vec::new(), false));
+        ctx.request_repaint();
+        return;
+    };
+    let raw = resp.body_mut().read_to_string().unwrap_or_default();
+    let list: Vec<String> = if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+        match prov {
+            ProviderKind::Ollama => v
+                .get("models")
+                .and_then(|m| m.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.get("name").and_then(|n| n.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            ProviderKind::OpenAiCompat => v
+                .get("data")
+                .and_then(|m| m.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.get("id").and_then(|n| n.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    } else {
+        Vec::new()
+    };
+    let _ = tx.send(WorkerEvent::Models(list, true));
+    ctx.request_repaint();
+}
+
+pub fn pull_ollama_model(base_url: &str, model: &str, tx: &Sender<WorkerEvent>, ctx: &egui::Context) {
+    let url = build_url(base_url, "/api/pull");
+    let payload = json!({ "model": model, "stream": true }).to_string();
+    let Ok(resp) = agent()
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .send(payload.as_str())
+    else {
+        let _ = tx.send(WorkerEvent::PullStatus("Failed to connect to Ollama".to_string(), false));
+        ctx.request_repaint();
+        return;
+    };
+    let reader = BufReader::new(resp.into_body().into_reader());
+    for line in reader.lines().flatten() {
+        if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
+            if let Some(st) = v.get("status").and_then(|s| s.as_str()) {
+                let done = st == "success";
+                let _ = tx.send(WorkerEvent::PullStatus(format!("{}: {}", model, st), done));
+                ctx.request_repaint();
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_agent_loop(
+    history: Vec<ChatMessage>,
+    prov: ProviderKind,
+    base_url: String,
+    api_key: String,
+    model: String,
+    system: String,
+    think: bool,
+    temp: f32,
+    num_ctx: i64,
+    keep_alive: String,
+    workspace: Option<PathBuf>,
+    safety: SafetyMode,
+    mcp_cfg: McpConfigFile,
+    mcp_tools: Vec<DiscoveredMcpTool>,
+    mcp_pool: Arc<McpPool>,
+    tx: Sender<WorkerEvent>,
+    cancel: Arc<AtomicBool>,
+    ctx: egui::Context,
+) {
+    let mut api_msgs: Vec<Value> = Vec::new();
+    let mut sys_full = system;
+    if let Some(ws) = &workspace {
+        sys_full.push_str(&format!(
+            "\nActive workspace directory: {}\nYou have workspace tools (list_dir, read_file, search_files, write_file, run_command).",
+            ws.display()
+        ));
+    }
+    if !mcp_tools.is_empty() {
+        sys_full.push_str("\nYou also have user-configured MCP tools prefixed with mcp__<server>__<tool>.");
+    }
+    if !sys_full.trim().is_empty() {
+        api_msgs.push(json!({ "role": "system", "content": sys_full }));
+    }
+    for m in history {
+        if m.role == "tool" {
+            api_msgs.push(json!({ "role": "tool", "content": m.content }));
+        } else if m.images.is_empty() {
+            api_msgs.push(json!({ "role": m.role, "content": m.content }));
+        } else {
+            api_msgs.push(json!({ "role": m.role, "content": m.content, "images": m.images }));
+        }
+    }
+
+    let mut all_tools: Vec<Value> = Vec::new();
+    if workspace.is_some() {
+        if let Some(arr) = tools::ollama_tools_schema().as_array() {
+            all_tools.extend(arr.iter().cloned());
+        }
+    }
+    all_tools.extend(mcp_client::to_tool_schemas(&mcp_tools));
+
+    let http_client = agent();
+
+    for _step in 0..8 {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let (subpath, payload) = match prov {
+            ProviderKind::Ollama => {
+                let mut body = json!({
+                    "model": model,
+                    "messages": api_msgs,
+                    "stream": true,
+                    "think": think,
+                    "keep_alive": keep_alive,
+                    "options": { "temperature": temp, "num_ctx": num_ctx }
+                });
+                if !all_tools.is_empty() {
+                    body["tools"] = Value::Array(all_tools.clone());
+                }
+                ("/api/chat", body.to_string())
+            }
+            ProviderKind::OpenAiCompat => {
+                let mut body = json!({
+                    "model": model,
+                    "messages": api_msgs,
+                    "stream": true,
+                    "temperature": temp
+                });
+                if !all_tools.is_empty() {
+                    body["tools"] = Value::Array(all_tools.clone());
+                }
+                ("/chat/completions", body.to_string())
+            }
+        };
+
+        let url = build_url(&base_url, subpath);
+        let mut req = http_client.post(&url).header("Content-Type", "application/json");
+        if !api_key.trim().is_empty() {
+            req = req.header("Authorization", &format!("Bearer {}", api_key.trim()));
+        }
+        let resp = match req.send(payload.as_str()) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(WorkerEvent::Error(format!("Request failed ({}): {}", url, e)));
+                break;
+            }
+        };
+
+        let mut assistant_text = String::new();
+        let mut tool_calls: Vec<Value> = Vec::new();
+        let mut oai_tc_acc: BTreeMap<usize, (String, String, String)> = BTreeMap::new();
+        let reader = BufReader::new(resp.into_body().into_reader());
+
+        for line in reader.lines().flatten() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut one = line.trim().to_string();
+            if one.is_empty() {
+                continue;
+            }
+            if prov == ProviderKind::OpenAiCompat {
+                if let Some(stripped) = one.strip_prefix("data:") {
+                    one = stripped.trim().to_string();
+                } else {
+                    continue;
+                }
+                if one == "[DONE]" {
+                    break;
+                }
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(&one) {
+                match prov {
+                    ProviderKind::Ollama => {
+                        if let Some(msg) = v.get("message") {
+                            if let Some(t) = msg.get("thinking").and_then(|x| x.as_str()) {
+                                if !t.is_empty() {
+                                    let _ = tx.send(WorkerEvent::Thinking(t.to_string()));
+                                    ctx.request_repaint();
+                                }
+                            }
+                            if let Some(c) = msg.get("content").and_then(|x| x.as_str()) {
+                                if !c.is_empty() {
+                                    assistant_text.push_str(c);
+                                    let _ = tx.send(WorkerEvent::Token(c.to_string()));
+                                    ctx.request_repaint();
+                                }
+                            }
+                            if let Some(tcs) = msg.get("tool_calls").and_then(|x| x.as_array()) {
+                                tool_calls.extend(tcs.iter().cloned());
+                            }
+                        }
+                    }
+                    ProviderKind::OpenAiCompat => {
+                        if let Some(delta) = v
+                            .get("choices")
+                            .and_then(|c| c.get(0))
+                            .and_then(|c| c.get("delta"))
+                        {
+                            if let Some(c) = delta.get("content").and_then(|x| x.as_str()) {
+                                if !c.is_empty() {
+                                    assistant_text.push_str(c);
+                                    let _ = tx.send(WorkerEvent::Token(c.to_string()));
+                                    ctx.request_repaint();
+                                }
+                            }
+                            if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
+                                for tc in tcs {
+                                    let idx = tc.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                                    let entry = oai_tc_acc
+                                        .entry(idx)
+                                        .or_insert_with(|| (String::new(), String::new(), String::new()));
+                                    if let Some(id) = tc.get("id").and_then(|x| x.as_str()) {
+                                        entry.0.push_str(id);
+                                    }
+                                    if let Some(f) = tc.get("function") {
+                                        if let Some(n) = f.get("name").and_then(|x| x.as_str()) {
+                                            entry.1.push_str(n);
+                                        }
+                                        if let Some(a) = f.get("arguments").and_then(|x| x.as_str()) {
+                                            entry.2.push_str(a);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if prov == ProviderKind::OpenAiCompat && !oai_tc_acc.is_empty() {
+            for (_idx, (id, name, args)) in oai_tc_acc {
+                tool_calls.push(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args }
+                }));
+            }
+        }
+
+        if tool_calls.is_empty() || cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        api_msgs.push(json!({
+            "role": "assistant",
+            "content": assistant_text,
+            "tool_calls": tool_calls
+        }));
+
+        for tc in tool_calls {
+            let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let func = tc.get("function").unwrap_or(&tc);
+            let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = match func.get("arguments") {
+                Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({})),
+                Some(v) => v.clone(),
+                None => json!({}),
+            };
+
+            let _ = tx.send(WorkerEvent::ToolStart(name.to_string()));
+            ctx.request_repaint();
+
+            let is_mcp = name.starts_with("mcp__");
+            let mut allowed = true;
+            if is_mcp || tools::is_mutating_tool(name) {
+                match safety {
+                    SafetyMode::ReadOnly => allowed = false,
+                    SafetyMode::Safe => {
+                        let preview = if is_mcp {
+                            format!("MCP Tool: {}\nArgs: {}", name, args)
+                        } else {
+                            tools::preview_tool(name, &args)
+                        };
+                        let diff_lines = if name == "write_file" {
+                            tools::compute_write_diff(workspace.as_deref(), &args)
+                        } else {
+                            Vec::new()
+                        };
+                        let (rtx, rrx) = mpsc::channel();
+                        let _ = tx.send(WorkerEvent::NeedApproval(PendingApproval {
+                            tool_name: name.to_string(),
+                            preview,
+                            diff_lines,
+                            reply_tx: rtx,
+                        }));
+                        ctx.request_repaint();
+                        allowed = rrx.recv().unwrap_or(false);
+                    }
+                    SafetyMode::AutoApprove => allowed = true,
+                }
+            }
+
+            let output = if !allowed {
+                format!("Tool '{}' denied by user or Read-Only mode.", name)
+            } else if is_mcp {
+                mcp_pool
+                    .call_tool(&mcp_cfg, name, &args)
+                    .unwrap_or_else(|e| format!("MCP error: {}", e))
+            } else {
+                tools::execute_tool(workspace.as_deref(), name, &args)
+            };
+
+            let _ = tx.send(WorkerEvent::ToolResult {
+                name: name.to_string(),
+                output: output.clone(),
+            });
+            ctx.request_repaint();
+            if prov == ProviderKind::OpenAiCompat && !tc_id.is_empty() {
+                api_msgs.push(json!({ "role": "tool", "tool_call_id": tc_id, "content": output }));
+            } else {
+                api_msgs.push(json!({ "role": "tool", "content": output }));
+            }
+        }
+    }
+
+    let _ = tx.send(WorkerEvent::Done);
+    ctx.request_repaint();
+}

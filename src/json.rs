@@ -358,3 +358,18 @@ impl<'a> Parser<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_and_encode_roundtrip() {
+        let src = r#"{"ok":true,"count":42,"items":["a","b\nc"],"nested":{"x":null}}"#;
+        let parsed = parse(src).unwrap();
+        assert_eq!(parsed.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(parsed.get("count").and_then(|v| v.as_i64()), Some(42));
+        let re = parse(&parsed.encode()).unwrap();
+        assert_eq!(parsed, re);
+    }
+}

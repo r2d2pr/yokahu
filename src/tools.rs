@@ -250,6 +250,38 @@ fn walk_tree(dir: &Path, depth: usize, out: &mut Vec<WorkspaceEntry>) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_boundary_blocks_escape() {
+        let ws = std::env::temp_dir().join("yokahu_test_ws");
+        let _ = fs::create_dir_all(&ws);
+        let res = execute_tool(
+            Some(&ws),
+            "write_file",
+            &json!({"path": "../outside.txt", "content": "nope"}),
+        );
+        assert!(res.contains("Blocked"));
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn diff_detects_changes() {
+        let ws = std::env::temp_dir().join("yokahu_test_diff");
+        let _ = fs::create_dir_all(&ws);
+        fs::write(ws.join("a.txt"), "line1\nold\nline3\n").unwrap();
+        let diff = compute_write_diff(
+            Some(&ws),
+            &json!({"path": "a.txt", "content": "line1\nnew\nline3\n"}),
+        );
+        assert!(diff.iter().any(|(k, l)| *k == '-' && l == "old"));
+        assert!(diff.iter().any(|(k, l)| *k == '+' && l == "new"));
+        let _ = fs::remove_dir_all(&ws);
+    }
+}
+
 pub fn execute_tool(workspace: Option<&Path>, name: &str, args: &Value) -> String {
     match name {
         "list_dir" => {
